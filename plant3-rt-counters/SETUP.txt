@@ -1,0 +1,88 @@
+PLANT 3 REAL-TIME COUNTER PIPELINE — SETUP GUIDE
+==================================================
+
+WHAT THIS DOES
+--------------
+Runs in the background and updates the infeed/outfeed counters
+for M1, M2, M3 every second in real time while a batch is active.
+
+
+STEP 1 — INSTALL PYTHON (first time only, no admin needed)
+-----------------------------------------------------------
+Open PowerShell and run these one by one:
+
+    Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+    irm get.scoop.sh | iex
+
+    scoop install python
+
+Check it worked:
+
+    python --version
+
+
+STEP 2 — INSTALL DEPENDENCIES (first time only)
+------------------------------------------------
+    pip install pyodbc python-dotenv
+
+
+STEP 3 — SET UP THE ENV FILE
+-----------------------------
+1. Go to the plant3-rt-counters folder
+2. Open .env with Notepad
+3. Fill in the database details:
+
+    DB_SERVER=<internal-server>
+    DB_NAME=DB_BUDIBASE
+    DB_USER=budibase
+    DB_PASSWORD=<redacted>
+
+Save and close.
+
+
+STEP 4 — TEST RUN
+-----------------
+Open PowerShell, navigate to this folder, and run:
+
+    python main.py
+
+You should see:
+    Plant 3 real-time counter pipeline starting — machines: ['M1', 'M2', 'M3']
+
+If it keeps running with no error — it is working.
+Press Ctrl+C to stop.
+
+
+STEP 5 — AUTO START ON LOGIN (run once, no admin needed)
+---------------------------------------------------------
+Replace the path below with the actual path to this folder, then run in PowerShell:
+
+    schtasks /create /tn "Plant3RTCounters" /tr "pythonw C:\path\to\plant3-rt-counters\main.py" /sc onlogon /ru %USERNAME%
+
+Example (adjust if folder is elsewhere):
+
+    schtasks /create /tn "Plant3RTCounters" /tr "pythonw C:\Users\supervisor\Desktop\plant3-rt-counters\main.py" /sc onlogon /ru %USERNAME%
+
+After this, the pipeline will start silently every time the PC is turned on or restarted.
+No console window will appear — it runs in the background.
+
+
+TO STOP THE AUTO START
+----------------------
+    schtasks /delete /tn "Plant3RTCounters" /f
+
+
+TROUBLESHOOTING
+---------------
+Error: ODBC Driver not found
+  -> Check which driver is installed:
+     Get-OdbcDriver | Select-Object Name
+  -> Open db.py in Notepad and change the driver number to match.
+
+Error: Login failed / cannot connect
+  -> Check the .env file — DB_SERVER, DB_USER, DB_PASSWORD
+
+Nothing seems to be updating
+  -> M1/M2/M3 may not have an active batch open (end time IS NULL).
+     The script only updates when a batch is running.
