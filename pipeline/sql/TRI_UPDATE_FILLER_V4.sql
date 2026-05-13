@@ -16,7 +16,10 @@
 --   [Change paper brik]  — one open row per active batch
 --   [Change strip]       — strip-change log per batch
 --
--- V4 adds breakdown logging on top of V3 (splice/CIP).
+-- V4 adds downtime (minor stoppage) logging on top of V3.
+-- "Downtime" here means any unplanned stop during production
+-- (step 8).  Full breakdown = >30 min — that classification
+-- is done at the reporting layer, not in the trigger.
 --
 -- EVENTS HANDLED
 -- -------------------------------------------------------
@@ -25,9 +28,9 @@
 --   Step 14 + CIP=1   → CIP end timestamp (Machine A/D only); 1-hr cooldown
 --   End roll 0→1      → Paper roll splice counted; 30-s bounce cooldown
 --   Strip signal 0→1  → Strip splice counted; 30-s bounce cooldown
---   Step 11 → 8 [NEW] → Machine breakdown — start timing downtime
+--   Step 11 → 8 [NEW] → Machine stopped — start timing downtime
 --   Step 8  → not 7   → Machine recovered — accumulate downtime seconds
---   Step 8  → 7 [NEW] → Batch aborted — nullify all breakdown data
+--   Step 8  → 7 [NEW] → Batch aborted — nullify all downtime data
 --
 -- HOW "OPEN BATCH" IS FOUND
 -- -------------------------------------------------------
@@ -36,20 +39,24 @@
 -- Rule:
 --   A / D machines  → End_time_CIP IS NULL  (CIP closes the row)
 --   All others      → [end time] IS NULL     (Step 13 closes the row)
--- Exception: all three breakdown sections use [end time] IS NULL
+-- Exception: all three downtime sections use [end time] IS NULL
 -- across the board (End_time_CIP logic not yet applied there).
 --
--- BREAKDOWN COLUMNS (added to [Change paper brik] in V4)
+-- DOWNTIME COLUMNS (added to [Change paper brik] in V4)
 -- -------------------------------------------------------
---   Breakdown_Count         INT  — number of times step hit 8 this batch
+--   Downtime_Count          INT  — number of stops (step 8 entries) this batch
 --   Total_Downtime_Seconds  INT  — cumulative downtime in seconds
---   Current_Breakdown_Start DATETIME — when current breakdown started
+--   Current_Downtime_Start  DATETIME — when current stop started
 --                                      (cleared to NULL on recovery)
 --
 -- Run these once before deploying if columns don't exist:
---   ALTER TABLE [Change paper brik] ADD Breakdown_Count          INT      NULL
---   ALTER TABLE [Change paper brik] ADD Total_Downtime_Seconds   INT      NULL
---   ALTER TABLE [Change paper brik] ADD Current_Breakdown_Start  DATETIME NULL
+--   ALTER TABLE [Change paper brik] ADD Downtime_Count          INT      NULL
+--   ALTER TABLE [Change paper brik] ADD Total_Downtime_Seconds  INT      NULL
+--   ALTER TABLE [Change paper brik] ADD Current_Downtime_Start  DATETIME NULL
+--
+-- If renaming from V4-beta columns (Breakdown_Count, Current_Breakdown_Start):
+--   EXEC sp_rename 'Change paper brik.Breakdown_Count',         'Downtime_Count',         'COLUMN'
+--   EXEC sp_rename 'Change paper brik.Current_Breakdown_Start', 'Current_Downtime_Start', 'COLUMN'
 --
 -- COOLDOWN LOGIC
 -- -------------------------------------------------------
@@ -64,9 +71,9 @@
 -- -------------------------------------------------------
 -- Every write also inserts a row into t_log(txt) with a
 -- structured key so you can trace exactly what fired:
---   _BD:START   breakdown started
---   _BD:END     breakdown ended (duration in seconds)
---   _BD:ABORT   batch aborted (step 8→7), breakdown nullified
+--   _DT:START   downtime started (step 11→8)
+--   _DT:END     downtime ended, duration in seconds logged
+--   _DT:ABORT   batch aborted (step 8→7), downtime nullified
 --   _EndRoll    paper roll splice
 --   _ST         strip splice
 --   _S14        CIP end event
@@ -399,13 +406,15 @@ BEGIN
                 END
 
                 -- -------------------------------------------------------
-                -- [V4 NEW] STEP 11 -> 8 : Breakdown Start
+                -- [V4 NEW] STEP 11 -> 8 : Downtime Start
                 -- Step 11 = machine running.  Step 8 = machine stopped
-                -- due to a fault.  On this transition we:
-                --   1. Increment Breakdown_Count for the open batch
-                --   2. Stamp Current_Breakdown_Start = now
-                -- The start time is kept in-row so we can calculate the
-                -- exact duration when the machine recovers.
+                -- (unplanned stop / minor stoppage).  On this transition:
+                --   1. Increment Downtime_Count for the open batch
+                --   2. Stamp Current_Downtime_Start = now
+                -- The start time is kept in-row so the exact duration can
+                -- be calculated when the machine recovers.
+                -- Note: "breakdown" in company terms = >30 min downtime.
+                -- That classification happens at the reporting layer.
                 -- Open batch: [end time] IS NULL (all machines).
                 -- -------------------------------------------------------
                 IF EXISTS (
@@ -415,57 +424,57 @@ BEGIN
                         AND d.Machine_Step_No = 11
                 )
                 BEGIN
-                        DECLARE @cur_Machine_BD   NVARCHAR(50)
-                        DECLARE @GID_BD           INT
-                        DECLARE @BD_Count         INT
+                        DECLARE @cur_Machine_DT   NVARCHAR(50)
+                        DECLARE @GID_DT           INT
+                        DECLARE @DT_Count         INT
 
-                        DECLARE bd_start_cursor CURSOR FOR
+                        DECLARE dt_start_cursor CURSOR FOR
                                 SELECT i.Machine
                                 FROM inserted i
                                 JOIN deleted d ON i.Machine = d.Machine
                                 WHERE i.Machine_Step_No = 8
                                 AND d.Machine_Step_No = 11
 
-                        OPEN bd_start_cursor
-                        FETCH NEXT FROM bd_start_cursor INTO @cur_Machine_BD
+                        OPEN dt_start_cursor
+                        FETCH NEXT FROM dt_start_cursor INTO @cur_Machine_DT
 
                         WHILE @@FETCH_STATUS = 0
                         BEGIN
-                                SELECT @GID_BD = MAX(ID)
+                                SELECT @GID_DT = MAX(ID)
                                 FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
-                                WHERE Machine = @cur_Machine_BD
+                                WHERE Machine = @cur_Machine_DT
                                 AND [end time] IS NULL
 
-                                IF @GID_BD IS NOT NULL
+                                IF @GID_DT IS NOT NULL
                                 BEGIN
-                                        SELECT @BD_Count = ISNULL(Breakdown_Count, 0) + 1
+                                        SELECT @DT_Count = ISNULL(Downtime_Count, 0) + 1
                                         FROM [Change paper brik]
-                                        WHERE ID = @GID_BD
+                                        WHERE ID = @GID_DT
 
                                         UPDATE [Change paper brik]
-                                        SET Breakdown_Count           = @BD_Count,
-                                            Current_Breakdown_Start   = GETUTCDATE()
-                                        WHERE ID = @GID_BD
+                                        SET Downtime_Count           = @DT_Count,
+                                            Current_Downtime_Start   = GETUTCDATE()
+                                        WHERE ID = @GID_DT
 
                                         INSERT INTO t_log(txt)
-                                        VALUES (@cur_Machine_BD + '_BD:START:ID=' + CAST(@GID_BD AS NVARCHAR) + ':count=' + CAST(@BD_Count AS NVARCHAR))
+                                        VALUES (@cur_Machine_DT + '_DT:START:ID=' + CAST(@GID_DT AS NVARCHAR) + ':count=' + CAST(@DT_Count AS NVARCHAR))
                                 END
 
-                                FETCH NEXT FROM bd_start_cursor INTO @cur_Machine_BD
+                                FETCH NEXT FROM dt_start_cursor INTO @cur_Machine_DT
                         END
 
-                        CLOSE bd_start_cursor
-                        DEALLOCATE bd_start_cursor
+                        CLOSE dt_start_cursor
+                        DEALLOCATE dt_start_cursor
                 END
 
                 -- -------------------------------------------------------
-                -- [V4 NEW] STEP 8 -> not 7 : Breakdown End (recovered)
+                -- [V4 NEW] STEP 8 -> not 7 : Downtime End (recovered)
                 -- Machine left step 8 and went to any step except 7,
                 -- meaning it recovered and resumed production.
-                -- Duration = DATEDIFF(SECOND, Current_Breakdown_Start, now)
-                -- This is added to Total_Downtime_Seconds (cumulative —
-                -- multiple breakdowns per batch all accumulate here).
-                -- Current_Breakdown_Start is cleared to NULL after use.
+                -- Duration = DATEDIFF(SECOND, Current_Downtime_Start, now)
+                -- Added to Total_Downtime_Seconds (cumulative — multiple
+                -- stops per batch all accumulate into one total).
+                -- Current_Downtime_Start is cleared to NULL after use.
                 -- -------------------------------------------------------
                 IF EXISTS (
                         SELECT 1 FROM inserted i
@@ -475,12 +484,12 @@ BEGIN
                         AND i.Machine_Step_No != 7
                 )
                 BEGIN
-                        DECLARE @cur_Machine_BDE   NVARCHAR(50)
-                        DECLARE @GID_BDE           INT
-                        DECLARE @BD_Start          DATETIME
-                        DECLARE @BD_Duration       INT
+                        DECLARE @cur_Machine_DTE   NVARCHAR(50)
+                        DECLARE @GID_DTE           INT
+                        DECLARE @DT_Start          DATETIME
+                        DECLARE @DT_Duration       INT
 
-                        DECLARE bd_end_cursor CURSOR FOR
+                        DECLARE dt_end_cursor CURSOR FOR
                                 SELECT i.Machine
                                 FROM inserted i
                                 JOIN deleted d ON i.Machine = d.Machine
@@ -488,52 +497,50 @@ BEGIN
                                 AND i.Machine_Step_No != 8
                                 AND i.Machine_Step_No != 7
 
-                        OPEN bd_end_cursor
-                        FETCH NEXT FROM bd_end_cursor INTO @cur_Machine_BDE
+                        OPEN dt_end_cursor
+                        FETCH NEXT FROM dt_end_cursor INTO @cur_Machine_DTE
 
                         WHILE @@FETCH_STATUS = 0
                         BEGIN
-                                SELECT @GID_BDE = MAX(ID)
+                                SELECT @GID_DTE = MAX(ID)
                                 FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
-                                WHERE Machine = @cur_Machine_BDE
+                                WHERE Machine = @cur_Machine_DTE
                                 AND [end time] IS NULL
 
-                                IF @GID_BDE IS NOT NULL
+                                IF @GID_DTE IS NOT NULL
                                 BEGIN
-                                        SELECT @BD_Start = Current_Breakdown_Start
+                                        SELECT @DT_Start = Current_Downtime_Start
                                         FROM [Change paper brik]
-                                        WHERE ID = @GID_BDE
+                                        WHERE ID = @GID_DTE
 
-                                        IF @BD_Start IS NOT NULL
+                                        IF @DT_Start IS NOT NULL
                                         BEGIN
-                                                SET @BD_Duration = DATEDIFF(SECOND, @BD_Start, GETUTCDATE())
+                                                SET @DT_Duration = DATEDIFF(SECOND, @DT_Start, GETUTCDATE())
 
                                                 UPDATE [Change paper brik]
-                                                SET Total_Downtime_Seconds  = ISNULL(Total_Downtime_Seconds, 0) + @BD_Duration,
-                                                    Current_Breakdown_Start = NULL
-                                                WHERE ID = @GID_BDE
+                                                SET Total_Downtime_Seconds  = ISNULL(Total_Downtime_Seconds, 0) + @DT_Duration,
+                                                    Current_Downtime_Start  = NULL
+                                                WHERE ID = @GID_DTE
 
                                                 INSERT INTO t_log(txt)
-                                                VALUES (@cur_Machine_BDE + '_BD:END:ID=' + CAST(@GID_BDE AS NVARCHAR) + ':duration=' + CAST(@BD_Duration AS NVARCHAR) + 's')
+                                                VALUES (@cur_Machine_DTE + '_DT:END:ID=' + CAST(@GID_DTE AS NVARCHAR) + ':duration=' + CAST(@DT_Duration AS NVARCHAR) + 's')
                                         END
                                 END
 
-                                FETCH NEXT FROM bd_end_cursor INTO @cur_Machine_BDE
+                                FETCH NEXT FROM dt_end_cursor INTO @cur_Machine_DTE
                         END
 
-                        CLOSE bd_end_cursor
-                        DEALLOCATE bd_end_cursor
+                        CLOSE dt_end_cursor
+                        DEALLOCATE dt_end_cursor
                 END
 
                 -- -------------------------------------------------------
                 -- [V4 NEW] STEP 8 -> 7 : Batch Aborted
                 -- Step 7 is a pre-run state that comes BEFORE step 11.
-                -- If the machine goes 8→7, the batch was abandoned rather
-                -- than recovered.  Breakdown data for this batch is
-                -- meaningless (no valid production run to measure against)
-                -- so we nullify all 3 breakdown columns.
-                -- This prevents incomplete downtime data from polluting
-                -- reports and Power BI KPIs.
+                -- If the machine goes 8→7 the batch was abandoned rather
+                -- than recovered — no valid production run to measure
+                -- downtime against.  Nullify all 3 downtime columns so
+                -- incomplete data does not pollute Power BI KPIs.
                 -- -------------------------------------------------------
                 IF EXISTS (
                         SELECT 1 FROM inserted i
@@ -542,43 +549,43 @@ BEGIN
                         AND i.Machine_Step_No = 7
                 )
                 BEGIN
-                        DECLARE @cur_Machine_BDA   NVARCHAR(50)
-                        DECLARE @GID_BDA           INT
+                        DECLARE @cur_Machine_DTA   NVARCHAR(50)
+                        DECLARE @GID_DTA           INT
 
-                        DECLARE bd_abort_cursor CURSOR FOR
+                        DECLARE dt_abort_cursor CURSOR FOR
                                 SELECT i.Machine
                                 FROM inserted i
                                 JOIN deleted d ON i.Machine = d.Machine
                                 WHERE d.Machine_Step_No = 8
                                 AND i.Machine_Step_No = 7
 
-                        OPEN bd_abort_cursor
-                        FETCH NEXT FROM bd_abort_cursor INTO @cur_Machine_BDA
+                        OPEN dt_abort_cursor
+                        FETCH NEXT FROM dt_abort_cursor INTO @cur_Machine_DTA
 
                         WHILE @@FETCH_STATUS = 0
                         BEGIN
-                                SELECT @GID_BDA = MAX(ID)
+                                SELECT @GID_DTA = MAX(ID)
                                 FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
-                                WHERE Machine = @cur_Machine_BDA
+                                WHERE Machine = @cur_Machine_DTA
                                 AND [end time] IS NULL
 
-                                IF @GID_BDA IS NOT NULL
+                                IF @GID_DTA IS NOT NULL
                                 BEGIN
                                         UPDATE [Change paper brik]
-                                        SET Breakdown_Count           = NULL,
-                                            Total_Downtime_Seconds    = NULL,
-                                            Current_Breakdown_Start   = NULL
-                                        WHERE ID = @GID_BDA
+                                        SET Downtime_Count           = NULL,
+                                            Total_Downtime_Seconds   = NULL,
+                                            Current_Downtime_Start   = NULL
+                                        WHERE ID = @GID_DTA
 
                                         INSERT INTO t_log(txt)
-                                        VALUES (@cur_Machine_BDA + '_BD:ABORT:ID=' + CAST(@GID_BDA AS NVARCHAR) + ':step8->7:nullified')
+                                        VALUES (@cur_Machine_DTA + '_DT:ABORT:ID=' + CAST(@GID_DTA AS NVARCHAR) + ':step8->7:nullified')
                                 END
 
-                                FETCH NEXT FROM bd_abort_cursor INTO @cur_Machine_BDA
+                                FETCH NEXT FROM dt_abort_cursor INTO @cur_Machine_DTA
                         END
 
-                        CLOSE bd_abort_cursor
-                        DEALLOCATE bd_abort_cursor
+                        CLOSE dt_abort_cursor
+                        DEALLOCATE dt_abort_cursor
                 END
 
         COMMIT TRANSACTION
