@@ -45,8 +45,9 @@ Python Poller (main.py)
     │
     ▼
 Processed Tables
-    ├── [Change paper brik]    ← Paper roll change events with splice times
+    ├── [Change paper brik]    ← Paper roll change events with splice times + downtime columns
     ├── [Change strip]         ← Strip change events
+    ├── [Down_log]             ← Structured downtime event log (START / END / ABORT per stop)
     ├── endtime_log_test       ← Audit log for Step 14 CIP events
     └── t_log                  ← General event log with machine/step/signal detail
 ```
@@ -82,6 +83,44 @@ Fires when `Machine_Step_no = 14` AND `Signal_Final_CIP = 1`. Includes a **1-hou
 
 ### `handle_end_roll` — Splice Signal
 Fires on the rising edge (0→1) of `Paper_Splicing_End_roll_Signal_Brik` or `Strip_Splicing_Signal_Strip`. Increments `Splicing_Count` and writes the next `Splicing time N` column. A **30-second in-memory cooldown** absorbs signal bounce — if the same machine fires again within the window, the cooldown rewrites the same timestamp column instead of creating a duplicate splice entry.
+
+---
+
+## SQL Trigger — TRI_UPDATE_FILLER_V4
+
+Some events cannot be captured by a 1-second Python poll. Splice signals pulse 0→1 in ~10ms — the Python poller misses most of them. For these, a SQL trigger (`TRI_UPDATE_FILLER_V4`) runs on `T_M_Filler_Process` and captures transitions synchronously at write time.
+
+V4 extends the splice/CIP logic from V3 with **downtime (minor stoppage) tracking**.
+
+### Downtime Columns on `[Change paper brik]`
+
+| Column | Type | Description |
+|---|---|---|
+| `Downtime_Count` | INT | Number of times machine hit step 8 this batch |
+| `Total_Downtime_Seconds` | INT | Cumulative downtime in seconds across all stops |
+| `Current_Downtime_Start` | DATETIME | Start of current stop (cleared on recovery) |
+
+### Downtime Event Logic
+
+| Step Transition | Action |
+|---|---|
+| 11 → 8 | Increment `Downtime_Count`, stamp `Current_Downtime_Start` |
+| 8 → anything except 7 | Calculate duration, add to `Total_Downtime_Seconds`, clear start |
+| 8 → 7 | Batch aborted — nullify all 3 downtime columns |
+
+> Company definition: **breakdown = >30 min**. The trigger logs raw seconds. The reporting layer (Power BI / Budibase) applies the threshold to classify minor stoppage vs. breakdown.
+
+### Down_log Table
+
+Every downtime event also writes a row to `[Down_log]` — a structured audit table for verifying trigger behaviour and building downtime reports without parsing `t_log` text.
+
+```sql
+SELECT * FROM Down_log ORDER BY Log_Time DESC
+-- Event: START, END, or ABORT
+-- Columns: Machine, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time
+```
+
+→ Full trigger source: [`sql/TRI_UPDATE_FILLER_V4.sql`](sql/TRI_UPDATE_FILLER_V4.sql)
 
 ---
 
