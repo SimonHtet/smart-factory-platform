@@ -1,0 +1,591 @@
+-- ============================================================
+-- TRI_UPDATE_FILLER_V4
+-- Database : DB_BUDIBASE
+-- Table    : T_M_Filler_Process  (PLC writes machine state here every cycle)
+-- Deployed : 2026-05-13
+-- Author   : Simon (DairyPlus Manufacturing Systems Engineer)
+--
+-- WHAT THIS TRIGGER DOES
+-- -------------------------------------------------------
+-- Fires AFTER every UPDATE on T_M_Filler_Process.
+-- The PLC updates rows in this table continuously as the
+-- Tetra Pak filler machines change state.  The trigger
+-- reads the transition (deleted = old row, inserted = new
+-- row) and writes structured batch data into two tables:
+--
+--   [Change paper brik]  — one open row per active batch
+--   [Change strip]       — strip-change log per batch
+--
+-- V4 adds breakdown logging on top of V3 (splice/CIP).
+--
+-- EVENTS HANDLED
+-- -------------------------------------------------------
+--   Step 10           → Splicing loop started
+--   Step 13           → Splicing loop ended; batch counter snapshot
+--   Step 14 + CIP=1   → CIP end timestamp (Machine A/D only); 1-hr cooldown
+--   End roll 0→1      → Paper roll splice counted; 30-s bounce cooldown
+--   Strip signal 0→1  → Strip splice counted; 30-s bounce cooldown
+--   Step 11 → 8 [NEW] → Machine breakdown — start timing downtime
+--   Step 8  → not 7   → Machine recovered — accumulate downtime seconds
+--   Step 8  → 7 [NEW] → Batch aborted — nullify all breakdown data
+--
+-- HOW "OPEN BATCH" IS FOUND
+-- -------------------------------------------------------
+-- Every section needs to know which [Change paper brik]
+-- row belongs to the current active batch for a machine.
+-- Rule:
+--   A / D machines  → End_time_CIP IS NULL  (CIP closes the row)
+--   All others      → [end time] IS NULL     (Step 13 closes the row)
+-- Exception: all three breakdown sections use [end time] IS NULL
+-- across the board (End_time_CIP logic not yet applied there).
+--
+-- BREAKDOWN COLUMNS (added to [Change paper brik] in V4)
+-- -------------------------------------------------------
+--   Breakdown_Count         INT  — number of times step hit 8 this batch
+--   Total_Downtime_Seconds  INT  — cumulative downtime in seconds
+--   Current_Breakdown_Start DATETIME — when current breakdown started
+--                                      (cleared to NULL on recovery)
+--
+-- Run these once before deploying if columns don't exist:
+--   ALTER TABLE [Change paper brik] ADD Breakdown_Count          INT      NULL
+--   ALTER TABLE [Change paper brik] ADD Total_Downtime_Seconds   INT      NULL
+--   ALTER TABLE [Change paper brik] ADD Current_Breakdown_Start  DATETIME NULL
+--
+-- COOLDOWN LOGIC
+-- -------------------------------------------------------
+-- Splice signals from the PLC can bounce (pulse 0→1
+-- multiple times within milliseconds for one physical
+-- event).  A 30-second cooldown window suppresses
+-- duplicate counts.  CIP end uses a 1-hour cooldown
+-- because Step 14 fires repeatedly while the machine
+-- stays in that state.
+--
+-- AUDIT LOG
+-- -------------------------------------------------------
+-- Every write also inserts a row into t_log(txt) with a
+-- structured key so you can trace exactly what fired:
+--   _BD:START   breakdown started
+--   _BD:END     breakdown ended (duration in seconds)
+--   _BD:ABORT   batch aborted (step 8→7), breakdown nullified
+--   _EndRoll    paper roll splice
+--   _ST         strip splice
+--   _S14        CIP end event
+-- ============================================================
+
+USE [DB_BUDIBASE]
+GO
+CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_FILLER_V4]
+ON [dbo].[T_M_Filler_Process]
+AFTER UPDATE
+AS
+BEGIN
+        SET NOCOUNT ON;
+
+        DECLARE @Machine                   NVARCHAR(50)
+        DECLARE @GID                       INT
+        DECLARE @GID_ST                    INT
+        DECLARE @Splicing_Count            INT
+        DECLARE @Splicing_Count_ST         INT
+        DECLARE @LastSpliceTime            DATETIME
+        DECLARE @LastStripTime             DATETIME
+        DECLARE @ColumnName                NVARCHAR(50)
+        DECLARE @SQL                       NVARCHAR(MAX)
+
+        BEGIN TRANSACTION
+        BEGIN TRY
+
+                -- -------------------------------------------------------
+                -- STEP 10 : Start Splicing Loop
+                -- Marks [Splicing time 1] on the open batch row for this
+                -- machine in both [Change paper brik] and [Change strip].
+                -- -------------------------------------------------------
+                IF EXISTS (SELECT 1 FROM inserted WHERE Machine_Step_No = 10)
+                BEGIN
+                        UPDATE cpb
+                        SET [Splicing time 1] = GETUTCDATE()
+                        FROM [Change paper brik] cpb
+                        JOIN inserted i ON cpb.Machine = i.Machine
+                        WHERE cpb.[Splicing time 1] IS NULL
+
+                        UPDATE cs
+                        SET [Splicing time 1] = GETUTCDATE()
+                        FROM [Change strip] cs
+                        JOIN (
+                                SELECT Machine, MAX(ID) MaxID FROM [Change strip] GROUP BY Machine
+                        ) x ON cs.Machine = x.Machine AND cs.ID = x.MaxID
+                        JOIN inserted i ON cs.Machine = i.Machine
+                        WHERE i.Machine_Step_No = 10
+                        AND cs.[Splicing time 1] IS NULL
+                END
+
+                -- -------------------------------------------------------
+                -- STEP 13 : End Splicing Loop
+                -- Closes the batch: writes [end time] and takes a final
+                -- snapshot of infeed/outfeed counters from the PLC row.
+                -- End_time_CIP is NOT written here — Step 14 handles that
+                -- separately for machines that go through CIP.
+                -- -------------------------------------------------------
+                IF EXISTS (SELECT 1 FROM inserted WHERE Machine_Step_No = 13)
+                BEGIN
+                        UPDATE cpb
+                        SET
+                                [end time]     = GETUTCDATE(),
+                                [In_Feed_MC]   = i.counter_infeed,
+                                [Out_Feed_MC]  = i.counter_outfeed
+                        FROM [Change paper brik] cpb
+                        JOIN inserted i ON cpb.Machine = i.Machine
+                        WHERE cpb.[end time] IS NULL
+                        AND cpb.[Splicing time 1] IS NOT NULL
+
+                        UPDATE cs
+                        SET [end time] = GETUTCDATE()
+                        FROM [Change strip] cs
+                        JOIN (
+                                SELECT Machine, MAX(ID) MaxID FROM [Change strip] GROUP BY Machine
+                        ) x ON cs.Machine = x.Machine AND cs.ID = x.MaxID
+                        JOIN inserted i ON cs.Machine = i.Machine
+                        WHERE i.Machine_Step_No = 13
+                        AND cs.[end time] IS NULL
+                        AND cs.[Splicing time 1] IS NOT NULL
+                END
+
+                -- -------------------------------------------------------
+                -- STEP 14 : CIP End  (Machine A and D only)
+                -- Machine A and D run a CIP (clean-in-place) cycle after
+                -- production.  Step 14 + Signal_Final_CIP=1 signals that
+                -- the CIP is fully complete.  We write End_time_CIP to
+                -- the [Change paper brik] row that already has [end time]
+                -- set (batch closed at Step 13, CIP closes it further).
+                -- 1-hour cooldown prevents duplicate writes while the
+                -- machine stays in step 14.
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted
+                        WHERE Machine_Step_No = 14
+                        AND Signal_Final_CIP = 1
+                        AND (Machine LIKE 'A%' OR Machine LIKE 'D%')
+                )
+                BEGIN
+                        DECLARE @cur_Machine_S14   NVARCHAR(50)
+                        DECLARE @GID_S14           INT
+                        DECLARE @LastLogTime_S14   DATETIME
+                        DECLARE @Outfeed_S14       NVARCHAR(50)
+                        DECLARE @EndTime_S14       DATETIME
+
+                        DECLARE step14_cursor CURSOR FOR
+                                SELECT DISTINCT Machine
+                                FROM inserted
+                                WHERE Machine_Step_No = 14
+                                AND Signal_Final_CIP = 1
+                                AND (Machine LIKE 'A%' OR Machine LIKE 'D%')
+
+                        OPEN step14_cursor
+                        FETCH NEXT FROM step14_cursor INTO @cur_Machine_S14
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                SELECT @GID_S14 = MAX(ID)
+                                FROM [Change paper brik]
+                                WHERE Machine      = @cur_Machine_S14
+                                AND [end time] IS NOT NULL
+
+                                IF @GID_S14 IS NOT NULL
+                                BEGIN
+                                        SELECT
+                                                @EndTime_S14  = [end time],
+                                                @Outfeed_S14  = CAST([Out_Feed_MC] AS NVARCHAR(50))
+                                        FROM [Change paper brik]
+                                        WHERE ID = @GID_S14
+
+                                        SELECT @LastLogTime_S14 = MAX(Log_Time)
+                                        FROM [endtime_log_test]
+                                        WHERE Machine = @cur_Machine_S14
+
+                                        IF @LastLogTime_S14 IS NULL
+                                        OR DATEDIFF(SECOND, @LastLogTime_S14, SYSDATETIME()) >= 3600
+                                        OR DATEDIFF(SECOND, @LastLogTime_S14, SYSDATETIME()) < 0
+                                        BEGIN
+                                                UPDATE [Change paper brik]
+                                                SET End_time_CIP = @EndTime_S14
+                                                WHERE ID = @GID_S14
+
+                                                INSERT INTO [endtime_log_test] (Machine, Step, Signal_CIP, Outfeed, End_Time, Log_Time)
+                                                VALUES (
+                                                        @cur_Machine_S14,
+                                                        14,
+                                                        1,
+                                                        @Outfeed_S14,
+                                                        @EndTime_S14,
+                                                        GETUTCDATE()
+                                                )
+
+                                                INSERT INTO t_log (txt)
+                                                VALUES (
+                                                        @cur_Machine_S14 + '_S14:CIP=1:ID=' + CAST(@GID_S14 AS NVARCHAR) +
+                                                        ':Outfeed=' + ISNULL(@Outfeed_S14, 'NULL') +
+                                                        ':EndTime=' + CONVERT(NVARCHAR, @EndTime_S14, 121) + '-LOGGED'
+                                                )
+                                        END
+                                        ELSE
+                                        BEGIN
+                                                INSERT INTO t_log (txt)
+                                                VALUES (
+                                                        @cur_Machine_S14 + '_S14:CIP=1:COOLDOWN' +
+                                                        ':diff=' + CAST(DATEDIFF(SECOND, @LastLogTime_S14, SYSDATETIME()) AS NVARCHAR) + 's' +
+                                                        ':remaining=' + CAST(3600 - DATEDIFF(SECOND, @LastLogTime_S14, SYSDATETIME()) AS NVARCHAR) + 's'
+                                                )
+                                        END
+                                END
+
+                                FETCH NEXT FROM step14_cursor INTO @cur_Machine_S14
+                        END
+
+                        CLOSE step14_cursor
+                        DEALLOCATE step14_cursor
+                END
+
+                -- -------------------------------------------------------
+                -- End Roll Signal (0 -> 1)  — paper roll splice counter
+                -- The PLC signal pulses 0→1 each time the machine splices
+                -- a new paper roll.  We count these per batch into
+                -- Splicing_Count and timestamp each one in dynamic columns
+                -- ([Splicing time 2], [Splicing time 3], ...).
+                -- 30-second cooldown suppresses PLC signal bounce.
+                -- A/D machines: open row = End_time_CIP IS NULL
+                -- Others      : open row = [end time] IS NULL
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted i
+                        JOIN deleted d ON i.Machine = d.Machine
+                        WHERE i.Paper_Splicing_End_roll_Signal_Brik = 1
+                        AND d.Paper_Splicing_End_roll_Signal_Brik = 0
+                )
+                BEGIN
+                        DECLARE @cur_Machine_ER NVARCHAR(50)
+
+                        DECLARE endroll_cursor CURSOR FOR
+                                SELECT i.Machine
+                                FROM inserted i
+                                JOIN deleted d ON i.Machine = d.Machine
+                                WHERE i.Paper_Splicing_End_roll_Signal_Brik = 1
+                                AND d.Paper_Splicing_End_roll_Signal_Brik = 0
+
+                        OPEN endroll_cursor
+                        FETCH NEXT FROM endroll_cursor INTO @cur_Machine_ER
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                IF @cur_Machine_ER LIKE 'A%' OR @cur_Machine_ER LIKE 'D%'
+                                BEGIN
+                                        SELECT @GID = MAX(ID)
+                                        FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                        WHERE Machine = @cur_Machine_ER
+                                        AND End_time_CIP IS NULL
+                                END
+                                ELSE
+                                BEGIN
+                                        SELECT @GID = MAX(ID)
+                                        FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                        WHERE Machine = @cur_Machine_ER
+                                        AND [end time] IS NULL
+                                END
+
+                                SELECT
+                                        @Splicing_Count   = ISNULL(Splicing_Count, 0) + 1,
+                                        @LastSpliceTime   = Last_Splice_Time
+                                FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE ID = @GID
+
+                                IF @LastSpliceTime IS NULL
+                                OR DATEDIFF(MILLISECOND, @LastSpliceTime, SYSDATETIME()) >= 30000
+                                OR DATEDIFF(MILLISECOND, @LastSpliceTime, SYSDATETIME()) < -500
+                                BEGIN
+                                        UPDATE [Change paper brik]
+                                        SET Splicing_Count     = @Splicing_Count,
+                                            Last_Splice_Time   = SYSDATETIME()
+                                        WHERE ID = @GID
+
+                                        SET @ColumnName = 'Splicing time ' + CAST(@Splicing_Count + 1 AS NVARCHAR)
+                                        SET @SQL = 'UPDATE [Change paper brik] SET [' + @ColumnName + '] = GETUTCDATE() WHERE ID = @ID'
+                                        EXEC sp_executesql @SQL, N'@ID INT', @ID = @GID
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_ER + '_EndRoll:' + CAST(@GID AS NVARCHAR) + ':' + CAST(@Splicing_Count AS NVARCHAR) + '-UPD')
+                                END
+                                ELSE
+                                BEGIN
+                                        SET @ColumnName = 'Splicing time ' + CAST(@Splicing_Count AS NVARCHAR)
+                                        SET @SQL = 'UPDATE [Change paper brik] SET [' + @ColumnName + '] = GETUTCDATE() WHERE ID = @ID'
+                                        EXEC sp_executesql @SQL, N'@ID INT', @ID = @GID
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_ER + '_EndRoll:COOLDOWN:count=' + CAST(@Splicing_Count - 1 AS NVARCHAR) +
+                                                ':diff=' + CAST(DATEDIFF(MILLISECOND, @LastSpliceTime, SYSDATETIME()) AS NVARCHAR) + 'ms')
+                                END
+
+                                FETCH NEXT FROM endroll_cursor INTO @cur_Machine_ER
+                        END
+
+                        CLOSE endroll_cursor
+                        DEALLOCATE endroll_cursor
+                END
+
+                -- -------------------------------------------------------
+                -- Strip Signal (0 -> 1)  — strip splice counter
+                -- Same bounce-cooldown logic as End Roll but targets
+                -- [Change strip] table.  No End_time_CIP on this table —
+                -- open row is always [end time] IS NULL for all machines.
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted i
+                        JOIN deleted d ON i.Machine = d.Machine
+                        WHERE i.Strip_Splicing_Signal_Strip = 1
+                        AND d.Strip_Splicing_Signal_Strip = 0
+                )
+                BEGIN
+                        DECLARE @cur_Machine_ST NVARCHAR(50)
+
+                        DECLARE strip_cursor CURSOR FOR
+                                SELECT i.Machine
+                                FROM inserted i
+                                JOIN deleted d ON i.Machine = d.Machine
+                                WHERE i.Strip_Splicing_Signal_Strip = 1
+                                AND d.Strip_Splicing_Signal_Strip = 0
+
+                        OPEN strip_cursor
+                        FETCH NEXT FROM strip_cursor INTO @cur_Machine_ST
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                SELECT @GID_ST = MAX(ID)
+                                FROM [Change Strip] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE Machine = @cur_Machine_ST
+
+                                SELECT
+                                        @Splicing_Count_ST   = ISNULL(Splicing_Count, 0) + 1,
+                                        @LastStripTime       = Last_Splice_Time
+                                FROM [Change Strip] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE ID = @GID_ST
+
+                                IF @LastStripTime IS NULL
+                                OR DATEDIFF(MILLISECOND, @LastStripTime, SYSDATETIME()) >= 30000
+                                OR DATEDIFF(MILLISECOND, @LastStripTime, SYSDATETIME()) < -500
+                                BEGIN
+                                        SET @ColumnName = 'Splicing time ' + CAST(@Splicing_Count_ST + 1 AS NVARCHAR)
+                                        SET @SQL = 'UPDATE [Change Strip] SET [' + @ColumnName + '] = GETUTCDATE(), Splicing_Count = @CNT, Last_Splice_Time = SYSDATETIME() WHERE ID = @ID AND [end time] IS NULL'
+                                        IF @Splicing_Count_ST = 1
+                                                SET @SQL = 'UPDATE [Change Strip] SET [' + @ColumnName + '] = GETUTCDATE(), Splicing_Count = @CNT, Last_Splice_Time = SYSDATETIME() WHERE ID = @ID AND [end time] IS NULL AND [Splicing time 1] IS NOT NULL'
+                                        EXEC sp_executesql @SQL, N'@ID INT, @CNT INT', @ID = @GID_ST, @CNT = @Splicing_Count_ST
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_ST + '_ST:' + CAST(@GID_ST AS NVARCHAR) + ':' + CAST(@Splicing_Count_ST AS NVARCHAR) + '-UPD')
+                                END
+                                ELSE
+                                BEGIN
+                                        SET @ColumnName = 'Splicing time ' + CAST(@Splicing_Count_ST AS NVARCHAR)
+                                        SET @SQL = 'UPDATE [Change Strip] SET [' + @ColumnName + '] = GETUTCDATE() WHERE ID = @ID AND [end time] IS NULL'
+                                        EXEC sp_executesql @SQL, N'@ID INT', @ID = @GID_ST
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_ST + '_ST:COOLDOWN:count=' + CAST(@Splicing_Count_ST - 1 AS NVARCHAR) +
+                                                ':diff=' + CAST(DATEDIFF(MILLISECOND, @LastStripTime, SYSDATETIME()) AS NVARCHAR) + 'ms')
+                                END
+
+                                FETCH NEXT FROM strip_cursor INTO @cur_Machine_ST
+                        END
+
+                        CLOSE strip_cursor
+                        DEALLOCATE strip_cursor
+                END
+
+                -- -------------------------------------------------------
+                -- [V4 NEW] STEP 11 -> 8 : Breakdown Start
+                -- Step 11 = machine running.  Step 8 = machine stopped
+                -- due to a fault.  On this transition we:
+                --   1. Increment Breakdown_Count for the open batch
+                --   2. Stamp Current_Breakdown_Start = now
+                -- The start time is kept in-row so we can calculate the
+                -- exact duration when the machine recovers.
+                -- Open batch: [end time] IS NULL (all machines).
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted i
+                        JOIN deleted d ON i.Machine = d.Machine
+                        WHERE i.Machine_Step_No = 8
+                        AND d.Machine_Step_No = 11
+                )
+                BEGIN
+                        DECLARE @cur_Machine_BD   NVARCHAR(50)
+                        DECLARE @GID_BD           INT
+                        DECLARE @BD_Count         INT
+
+                        DECLARE bd_start_cursor CURSOR FOR
+                                SELECT i.Machine
+                                FROM inserted i
+                                JOIN deleted d ON i.Machine = d.Machine
+                                WHERE i.Machine_Step_No = 8
+                                AND d.Machine_Step_No = 11
+
+                        OPEN bd_start_cursor
+                        FETCH NEXT FROM bd_start_cursor INTO @cur_Machine_BD
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                SELECT @GID_BD = MAX(ID)
+                                FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE Machine = @cur_Machine_BD
+                                AND [end time] IS NULL
+
+                                IF @GID_BD IS NOT NULL
+                                BEGIN
+                                        SELECT @BD_Count = ISNULL(Breakdown_Count, 0) + 1
+                                        FROM [Change paper brik]
+                                        WHERE ID = @GID_BD
+
+                                        UPDATE [Change paper brik]
+                                        SET Breakdown_Count           = @BD_Count,
+                                            Current_Breakdown_Start   = GETUTCDATE()
+                                        WHERE ID = @GID_BD
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_BD + '_BD:START:ID=' + CAST(@GID_BD AS NVARCHAR) + ':count=' + CAST(@BD_Count AS NVARCHAR))
+                                END
+
+                                FETCH NEXT FROM bd_start_cursor INTO @cur_Machine_BD
+                        END
+
+                        CLOSE bd_start_cursor
+                        DEALLOCATE bd_start_cursor
+                END
+
+                -- -------------------------------------------------------
+                -- [V4 NEW] STEP 8 -> not 7 : Breakdown End (recovered)
+                -- Machine left step 8 and went to any step except 7,
+                -- meaning it recovered and resumed production.
+                -- Duration = DATEDIFF(SECOND, Current_Breakdown_Start, now)
+                -- This is added to Total_Downtime_Seconds (cumulative —
+                -- multiple breakdowns per batch all accumulate here).
+                -- Current_Breakdown_Start is cleared to NULL after use.
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted i
+                        JOIN deleted d ON i.Machine = d.Machine
+                        WHERE d.Machine_Step_No = 8
+                        AND i.Machine_Step_No != 8
+                        AND i.Machine_Step_No != 7
+                )
+                BEGIN
+                        DECLARE @cur_Machine_BDE   NVARCHAR(50)
+                        DECLARE @GID_BDE           INT
+                        DECLARE @BD_Start          DATETIME
+                        DECLARE @BD_Duration       INT
+
+                        DECLARE bd_end_cursor CURSOR FOR
+                                SELECT i.Machine
+                                FROM inserted i
+                                JOIN deleted d ON i.Machine = d.Machine
+                                WHERE d.Machine_Step_No = 8
+                                AND i.Machine_Step_No != 8
+                                AND i.Machine_Step_No != 7
+
+                        OPEN bd_end_cursor
+                        FETCH NEXT FROM bd_end_cursor INTO @cur_Machine_BDE
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                SELECT @GID_BDE = MAX(ID)
+                                FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE Machine = @cur_Machine_BDE
+                                AND [end time] IS NULL
+
+                                IF @GID_BDE IS NOT NULL
+                                BEGIN
+                                        SELECT @BD_Start = Current_Breakdown_Start
+                                        FROM [Change paper brik]
+                                        WHERE ID = @GID_BDE
+
+                                        IF @BD_Start IS NOT NULL
+                                        BEGIN
+                                                SET @BD_Duration = DATEDIFF(SECOND, @BD_Start, GETUTCDATE())
+
+                                                UPDATE [Change paper brik]
+                                                SET Total_Downtime_Seconds  = ISNULL(Total_Downtime_Seconds, 0) + @BD_Duration,
+                                                    Current_Breakdown_Start = NULL
+                                                WHERE ID = @GID_BDE
+
+                                                INSERT INTO t_log(txt)
+                                                VALUES (@cur_Machine_BDE + '_BD:END:ID=' + CAST(@GID_BDE AS NVARCHAR) + ':duration=' + CAST(@BD_Duration AS NVARCHAR) + 's')
+                                        END
+                                END
+
+                                FETCH NEXT FROM bd_end_cursor INTO @cur_Machine_BDE
+                        END
+
+                        CLOSE bd_end_cursor
+                        DEALLOCATE bd_end_cursor
+                END
+
+                -- -------------------------------------------------------
+                -- [V4 NEW] STEP 8 -> 7 : Batch Aborted
+                -- Step 7 is a pre-run state that comes BEFORE step 11.
+                -- If the machine goes 8→7, the batch was abandoned rather
+                -- than recovered.  Breakdown data for this batch is
+                -- meaningless (no valid production run to measure against)
+                -- so we nullify all 3 breakdown columns.
+                -- This prevents incomplete downtime data from polluting
+                -- reports and Power BI KPIs.
+                -- -------------------------------------------------------
+                IF EXISTS (
+                        SELECT 1 FROM inserted i
+                        JOIN deleted d ON i.Machine = d.Machine
+                        WHERE d.Machine_Step_No = 8
+                        AND i.Machine_Step_No = 7
+                )
+                BEGIN
+                        DECLARE @cur_Machine_BDA   NVARCHAR(50)
+                        DECLARE @GID_BDA           INT
+
+                        DECLARE bd_abort_cursor CURSOR FOR
+                                SELECT i.Machine
+                                FROM inserted i
+                                JOIN deleted d ON i.Machine = d.Machine
+                                WHERE d.Machine_Step_No = 8
+                                AND i.Machine_Step_No = 7
+
+                        OPEN bd_abort_cursor
+                        FETCH NEXT FROM bd_abort_cursor INTO @cur_Machine_BDA
+
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                                SELECT @GID_BDA = MAX(ID)
+                                FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
+                                WHERE Machine = @cur_Machine_BDA
+                                AND [end time] IS NULL
+
+                                IF @GID_BDA IS NOT NULL
+                                BEGIN
+                                        UPDATE [Change paper brik]
+                                        SET Breakdown_Count           = NULL,
+                                            Total_Downtime_Seconds    = NULL,
+                                            Current_Breakdown_Start   = NULL
+                                        WHERE ID = @GID_BDA
+
+                                        INSERT INTO t_log(txt)
+                                        VALUES (@cur_Machine_BDA + '_BD:ABORT:ID=' + CAST(@GID_BDA AS NVARCHAR) + ':step8->7:nullified')
+                                END
+
+                                FETCH NEXT FROM bd_abort_cursor INTO @cur_Machine_BDA
+                        END
+
+                        CLOSE bd_abort_cursor
+                        DEALLOCATE bd_abort_cursor
+                END
+
+        COMMIT TRANSACTION
+        END TRY
+        BEGIN CATCH
+                ROLLBACK TRANSACTION
+                INSERT INTO t_log(txt) VALUES (ERROR_MESSAGE())
+        END CATCH
+
+END
