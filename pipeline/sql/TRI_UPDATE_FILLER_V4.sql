@@ -58,6 +58,18 @@
 --   EXEC sp_rename 'Change paper brik.Breakdown_Count',         'Downtime_Count',         'COLUMN'
 --   EXEC sp_rename 'Change paper brik.Current_Breakdown_Start', 'Current_Downtime_Start', 'COLUMN'
 --
+-- DOWN_LOG TABLE (create once):
+--   CREATE TABLE [dbo].[Down_log] (
+--       ID                     INT IDENTITY(1,1) PRIMARY KEY,
+--       Machine                NVARCHAR(50),
+--       Event                  NVARCHAR(10),   -- 'START', 'END', 'ABORT'
+--       Batch_ID               INT,            -- ID from [Change paper brik]
+--       Downtime_Count         INT,            -- which stop number this batch
+--       Duration_Seconds       INT,            -- NULL on START/ABORT, filled on END
+--       Total_Downtime_Seconds INT,            -- running total after END, NULL on START/ABORT
+--       Log_Time               DATETIME        -- GETUTCDATE()
+--   )
+--
 -- COOLDOWN LOGIC
 -- -------------------------------------------------------
 -- Splice signals from the PLC can bounce (pulse 0→1
@@ -458,6 +470,9 @@ BEGIN
 
                                         INSERT INTO t_log(txt)
                                         VALUES (@cur_Machine_DT + '_DT:START:ID=' + CAST(@GID_DT AS NVARCHAR) + ':count=' + CAST(@DT_Count AS NVARCHAR))
+
+                                        INSERT INTO [Down_log] (Machine, Event, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time)
+                                        VALUES (@cur_Machine_DT, 'START', @GID_DT, @DT_Count, NULL, NULL, GETUTCDATE())
                                 END
 
                                 FETCH NEXT FROM dt_start_cursor INTO @cur_Machine_DT
@@ -488,6 +503,8 @@ BEGIN
                         DECLARE @GID_DTE           INT
                         DECLARE @DT_Start          DATETIME
                         DECLARE @DT_Duration       INT
+                        DECLARE @DT_CountEnd       INT
+                        DECLARE @DT_NewTotal       INT
 
                         DECLARE dt_end_cursor CURSOR FOR
                                 SELECT i.Machine
@@ -509,21 +526,26 @@ BEGIN
 
                                 IF @GID_DTE IS NOT NULL
                                 BEGIN
-                                        SELECT @DT_Start = Current_Downtime_Start
+                                        SELECT @DT_Start    = Current_Downtime_Start,
+                                               @DT_CountEnd = Downtime_Count
                                         FROM [Change paper brik]
                                         WHERE ID = @GID_DTE
 
                                         IF @DT_Start IS NOT NULL
                                         BEGIN
                                                 SET @DT_Duration = DATEDIFF(SECOND, @DT_Start, GETUTCDATE())
+                                                SET @DT_NewTotal = ISNULL((SELECT Total_Downtime_Seconds FROM [Change paper brik] WHERE ID = @GID_DTE), 0) + @DT_Duration
 
                                                 UPDATE [Change paper brik]
-                                                SET Total_Downtime_Seconds  = ISNULL(Total_Downtime_Seconds, 0) + @DT_Duration,
+                                                SET Total_Downtime_Seconds  = @DT_NewTotal,
                                                     Current_Downtime_Start  = NULL
                                                 WHERE ID = @GID_DTE
 
                                                 INSERT INTO t_log(txt)
                                                 VALUES (@cur_Machine_DTE + '_DT:END:ID=' + CAST(@GID_DTE AS NVARCHAR) + ':duration=' + CAST(@DT_Duration AS NVARCHAR) + 's')
+
+                                                INSERT INTO [Down_log] (Machine, Event, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time)
+                                                VALUES (@cur_Machine_DTE, 'END', @GID_DTE, @DT_CountEnd, @DT_Duration, @DT_NewTotal, GETUTCDATE())
                                         END
                                 END
 
@@ -551,6 +573,7 @@ BEGIN
                 BEGIN
                         DECLARE @cur_Machine_DTA   NVARCHAR(50)
                         DECLARE @GID_DTA           INT
+                        DECLARE @DT_CountAbort     INT
 
                         DECLARE dt_abort_cursor CURSOR FOR
                                 SELECT i.Machine
@@ -571,6 +594,10 @@ BEGIN
 
                                 IF @GID_DTA IS NOT NULL
                                 BEGIN
+                                        SELECT @DT_CountAbort = Downtime_Count
+                                        FROM [Change paper brik]
+                                        WHERE ID = @GID_DTA
+
                                         UPDATE [Change paper brik]
                                         SET Downtime_Count           = NULL,
                                             Total_Downtime_Seconds   = NULL,
@@ -579,6 +606,9 @@ BEGIN
 
                                         INSERT INTO t_log(txt)
                                         VALUES (@cur_Machine_DTA + '_DT:ABORT:ID=' + CAST(@GID_DTA AS NVARCHAR) + ':step8->7:nullified')
+
+                                        INSERT INTO [Down_log] (Machine, Event, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time)
+                                        VALUES (@cur_Machine_DTA, 'ABORT', @GID_DTA, @DT_CountAbort, NULL, NULL, GETUTCDATE())
                                 END
 
                                 FETCH NEXT FROM dt_abort_cursor INTO @cur_Machine_DTA
