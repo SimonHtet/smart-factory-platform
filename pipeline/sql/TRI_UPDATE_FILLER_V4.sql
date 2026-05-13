@@ -29,7 +29,7 @@
 --   End roll 0→1      → Paper roll splice counted; 30-s bounce cooldown
 --   Strip signal 0→1  → Strip splice counted; 30-s bounce cooldown
 --   Step 11 → 8 [NEW] → Machine stopped — start timing downtime
---   Step 8  → not 7   → Machine recovered — accumulate downtime seconds
+--   Step 8  → 9       → Machine recovered — accumulate downtime seconds
 --   Step 8  → 7 [NEW] → Batch aborted — nullify all downtime data
 --
 -- HOW "OPEN BATCH" IS FOUND
@@ -483,9 +483,12 @@ BEGIN
                 END
 
                 -- -------------------------------------------------------
-                -- [V4 NEW] STEP 8 -> not 7 : Downtime End (recovered)
-                -- Machine left step 8 and went to any step except 7,
-                -- meaning it recovered and resumed production.
+                -- [V4 NEW] STEP 8 -> 9 : Downtime End (recovered)
+                -- Step 9 is the recovery step before returning to step 11.
+                -- Only fires if Current_Downtime_Start IS NOT NULL (inner
+                -- guard on line below), meaning a real 11→8→9 sequence
+                -- occurred.  Startup 8→9 (no prior 11→8) is skipped because
+                -- Current_Downtime_Start is NULL in that case.
                 -- Duration = DATEDIFF(SECOND, Current_Downtime_Start, now)
                 -- Added to Total_Downtime_Seconds (cumulative — multiple
                 -- stops per batch all accumulate into one total).
@@ -495,8 +498,7 @@ BEGIN
                         SELECT 1 FROM inserted i
                         JOIN deleted d ON i.Machine = d.Machine
                         WHERE d.Machine_Step_No = 8
-                        AND i.Machine_Step_No != 8
-                        AND i.Machine_Step_No != 7
+                        AND i.Machine_Step_No = 9
                 )
                 BEGIN
                         DECLARE @cur_Machine_DTE   NVARCHAR(50)
@@ -511,8 +513,7 @@ BEGIN
                                 FROM inserted i
                                 JOIN deleted d ON i.Machine = d.Machine
                                 WHERE d.Machine_Step_No = 8
-                                AND i.Machine_Step_No != 8
-                                AND i.Machine_Step_No != 7
+                                AND i.Machine_Step_No = 9
 
                         OPEN dt_end_cursor
                         FETCH NEXT FROM dt_end_cursor INTO @cur_Machine_DTE
@@ -557,12 +558,12 @@ BEGIN
                 END
 
                 -- -------------------------------------------------------
-                -- [V4 NEW] STEP 8 -> 7 : Batch Aborted
-                -- Step 7 is a pre-run state that comes BEFORE step 11.
-                -- If the machine goes 8→7 the batch was abandoned rather
-                -- than recovered — no valid production run to measure
-                -- downtime against.  Nullify all 3 downtime columns so
-                -- incomplete data does not pollute Power BI KPIs.
+                -- [V4 NEW] STEP 8 -> 7 : Batch Aborted (current stop only)
+                -- Step 7 is pre-run — machine went 8→7 without recovering.
+                -- Only undo the in-progress stop: decrement Downtime_Count
+                -- by 1 and clear Current_Downtime_Start.
+                -- Total_Downtime_Seconds from previous valid stops is kept.
+                -- No-op if Current_Downtime_Start is NULL (no active stop).
                 -- -------------------------------------------------------
                 IF EXISTS (
                         SELECT 1 FROM inserted i
@@ -594,21 +595,24 @@ BEGIN
 
                                 IF @GID_DTA IS NOT NULL
                                 BEGIN
-                                        SELECT @DT_CountAbort = Downtime_Count
+                                        SELECT @DT_CountAbort = Downtime_Count,
+                                               @DT_Start      = Current_Downtime_Start
                                         FROM [Change paper brik]
                                         WHERE ID = @GID_DTA
 
-                                        UPDATE [Change paper brik]
-                                        SET Downtime_Count           = NULL,
-                                            Total_Downtime_Seconds   = NULL,
-                                            Current_Downtime_Start   = NULL
-                                        WHERE ID = @GID_DTA
+                                        IF @DT_Start IS NOT NULL
+                                        BEGIN
+                                                UPDATE [Change paper brik]
+                                                SET Downtime_Count         = ISNULL(Downtime_Count, 1) - 1,
+                                                    Current_Downtime_Start = NULL
+                                                WHERE ID = @GID_DTA
 
-                                        INSERT INTO t_log(txt)
-                                        VALUES (@cur_Machine_DTA + '_DT:ABORT:ID=' + CAST(@GID_DTA AS NVARCHAR) + ':step8->7:nullified')
+                                                INSERT INTO t_log(txt)
+                                                VALUES (@cur_Machine_DTA + '_DT:ABORT:ID=' + CAST(@GID_DTA AS NVARCHAR) + ':step8->7:count=' + CAST(@DT_CountAbort AS NVARCHAR) + ':decremented')
 
-                                        INSERT INTO [Down_log] (Machine, Event, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time)
-                                        VALUES (@cur_Machine_DTA, 'ABORT', @GID_DTA, @DT_CountAbort, NULL, NULL, GETUTCDATE())
+                                                INSERT INTO [Down_log] (Machine, Event, Batch_ID, Downtime_Count, Duration_Seconds, Total_Downtime_Seconds, Log_Time)
+                                                VALUES (@cur_Machine_DTA, 'ABORT', @GID_DTA, @DT_CountAbort, NULL, NULL, GETUTCDATE())
+                                        END
                                 END
 
                                 FETCH NEXT FROM dt_abort_cursor INTO @cur_Machine_DTA
