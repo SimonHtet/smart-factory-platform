@@ -21,18 +21,33 @@ Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and
 PLC Hardware (23 Tetra Pak fillers)
     │
     ▼
-SQL Server — T_M_Filler_Process
-    │                         │
-    ├── SQL Trigger (V4)       │  Python pipeline
-    │   step transitions       │  1-second poll loop
-    │   downtime logging       │
-    ▼                         ▼
-Processed tables          KPI Dashboard (Power BI DirectQuery)
-  [Change paper brik]     efficiency, yield, waste %, batch analysis
-  [Change strip]
-  [Down_log]   ← downtime events (START / END / ABORT per batch)
-  t_log        ← general audit trail
-  endtime_log_test
+OPMS (plant operations application)
+— collects all PLC state in real time, writes to T_M_Filler_Process
+
+WMS SQL Server (warehouse management)
+— finished goods tracking, last stop in production flow
+— ingested via Python into DB_BUDIBASE every 5 minutes
+
+    │ SQL Trigger (V4)          │ Python pipeline        │ Python ingest
+    │ sub-second event capture  │ 1-second poll loop     │ WMS → analytics
+    ▼                           ▼                        ▼
+┌──────────────────────────────────────────────────────────────┐
+│                   DB_BUDIBASE (central hub)                  │
+│                                                              │
+│  dbo.*                        analytics.*                    │
+│  ─────────────────────        ──────────────────────────     │
+│  T_M_Filler_Process           raw_wms_transactions           │
+│  [Change paper brik]          raw_wms_receive_item           │
+│  [Change strip]               raw_wms_receive_item_location  │
+│  [Down_log]                   stg_* / mart_* (dbt)          │
+│  t_log                                                       │
+└──────────────────┬───────────────────────────────────────────┘
+                   │
+         ┌─────────┴──────────┐
+         ▼                    ▼
+   Power BI               Budibase Apps
+   KPI dashboard          16+ apps, 100+ DAU
+   (director-level)
 ```
 
 ---
@@ -54,8 +69,8 @@ For events that require sub-second capture (splice signals pulse in ~10ms — to
 | Transition | Event | What's recorded |
 |---|---|---|
 | Step 11 → 8 | `START` | Machine, Batch_ID, stop count |
-| Step 8 → any (not 7) | `END` | Duration in seconds, cumulative total |
-| Step 8 → 7 | `ABORT` | Batch abandoned — downtime data nullified |
+| Step 8 → 9 | `END` | Duration in seconds, cumulative total |
+| Step 8 → 7 | `ABORT` | In-progress stop undone — previous valid stops preserved |
 
 > `[Down_log]` is a structured audit table — queryable per machine/batch unlike the raw text in `t_log`. "Breakdown" in company terms means >30 min; that classification is applied at the reporting layer from `Total_Downtime_Seconds`.
 
