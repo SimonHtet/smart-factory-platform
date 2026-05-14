@@ -20,41 +20,42 @@ Built in-house to replace a ฿3M+ vendor quote for custom MES trigger logic and
 ## Architecture
 
 ```
-┌─────────────────────┐   ┌──────────────────────────┐   ┌───────────────────┐
-│  DairyPlus Core     │   │  WMS Server              │   │  OPMS Server      │
-│  <internal-server>        │   │  <internal-server>             │   │  172.22.1.34      │
-│                     │   │  WMSDairyPlus2015        │   │  Sensor/temp data │
-│  PLC Hardware       │   │                          │   │  (planned ingest) │
-│  23 Tetra Pak       │   │  tbl_Transaction         │   └───────────────────┘
-│  fillers            │   │  tbl_ReceiveItem         │
-│     │               │   │  tbl_ReceiveItemLocation │
-│     ▼               │   │  mst_Product             │
-│  OPMS Application   │   └────────────┬─────────────┘
-│  writes machine     │                │
-│  state to SQL       │     Python ingest_wms.py
-│     │               │     every 5 min (Task Scheduler)
-│     ▼               │                │
-│  SQL Trigger V4     │                ▼
-│  sub-second capture │   ┌────────────────────────────────────────────────┐
-│     │               │   │              DB_BUDIBASE (central hub)         │
-│     ├──────────────────►│                                                │
-│                     │   │  dbo.*                    analytics.*          │
-└─────────────────────┘   │  ──────────────────        ─────────────────  │
-                          │  T_M_Filler_Process        raw_wms_*          │
-                          │  [Change paper brik]       stg_* (views)      │
-                          │  [Change strip]            mart_production     │
-                          │  Down_log                       _runs (table) │
-                          │  t_log                     mart_production     │
-                          │                                 _runs_view     │
-                          └───────────────┬────────────────────────────────┘
-                                          │  dbt run every 10 min
-                                          │  (Task Scheduler)
-                               ┌──────────┴──────────┐
-                               ▼                      ▼
-                         Power BI                Budibase Apps
-                         DirectQuery             16+ apps
-                         mart_production         100+ DAU
-                         _runs_view
+PLC Hardware (23 Tetra Pak fillers)
+    │
+    ▼
+OPMS Server (<internal-server>) — Tetra Pak proprietary system
+  Collects PLC machine state in real time.
+  Read-only access — vendor-owned, cannot create tables here.
+  OPMS writes machine state directly into DB_BUDIBASE.dbo.T_M_Filler_Process.
+    │
+    ▼
+WMS Server (<internal-server>) — WMSDairyPlus2015
+  Finished goods tracking — carton scanning, product resends.
+  Read-only access — must pull data into DB_BUDIBASE to transform.
+    │
+    │  Python ingest_wms.py          SQL Trigger V4
+    │  every 5 min                   fires on every write to
+    │  (Task Scheduler)              T_M_Filler_Process
+    ▼                                (event-driven, sub-second)
+┌──────────────────────────────────────────────────────────────────┐
+│                  DB_BUDIBASE  <internal-server>  (db_owner)            │
+│  Only server where Simon can create tables and run dbt.          │
+│  All cross-system joins happen here after data lands.            │
+│                                                                  │
+│  dbo.*                          analytics.*                      │
+│  ──────────────────             ────────────────────────────     │
+│  T_M_Filler_Process             raw_wms_*  (ingest landing)      │
+│  [Change paper brik]            stg_*      (dbt views)           │
+│  Down_log                       mart_production_runs  (table)    │
+│  t_log                          mart_production_runs_view        │
+└──────────────────────┬───────────────────────────────────────────┘
+                       │  dbt run every 10 min (Task Scheduler)
+            ┌──────────┴──────────┐
+            ▼                     ▼
+      Power BI               Budibase Apps
+      DirectQuery            16+ apps, 100+ DAU
+      mart_production
+      _runs_view
 ```
 
 ---
