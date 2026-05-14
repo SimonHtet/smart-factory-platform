@@ -2,7 +2,7 @@
 
 End-to-end manufacturing data platform built for DairyPlus Co., Ltd. (Bangkok) — covering 23 Tetra Pak filler machines across 3 dairy production plants.
 
-Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and reporting. Delivered in 6 months against an 18-month vendor timeline.
+Built in-house to replace a ฿3M+ vendor quote for custom MES trigger logic and reporting. Delivered in 6 months against an 18-month vendor timeline.
 
 ---
 
@@ -10,53 +10,83 @@ Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and
 
 | Folder | Description |
 |--------|-------------|
-| [`pipeline/`](pipeline/) | Python event pipeline — replaces SQL Server triggers, polls PLC data at 1-second intervals, processes machine step transitions |
-| [`dashboard/`](dashboard/) | Power BI KPI dashboard — machine efficiency, yield per batch, waste analysis, reviewed weekly at director level |
+| [`pipeline/`](pipeline/) | Python event pipeline — polls PLC data at 1-second intervals, processes machine step transitions |
+| [`pipeline/dbt/`](pipeline/dbt/) | dbt transformation layer — staging models, mart, and WMS ingest scripts |
+| [`dashboard/`](dashboard/) | Power BI KPI dashboard — machine efficiency, yield, waste analysis, reviewed at director level |
+| [`notebooks/`](notebooks/) | Predictive maintenance prototype — scikit-learn on OPMS sensor data |
 
 ---
 
 ## Architecture
 
 ```
-PLC Hardware (23 Tetra Pak fillers)
-    │
-    ▼
-OPMS (plant operations application)
-— collects all PLC state in real time, writes to T_M_Filler_Process
-
-WMS SQL Server (warehouse management)
-— finished goods tracking, last stop in production flow
-— ingested via Python into DB_BUDIBASE every 5 minutes
-
-    │ SQL Trigger (V4)          │ Python pipeline        │ Python ingest
-    │ sub-second event capture  │ 1-second poll loop     │ WMS → analytics
-    ▼                           ▼                        ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   DB_BUDIBASE (central hub)                  │
-│                                                              │
-│  dbo.*                        analytics.*                    │
-│  ─────────────────────        ──────────────────────────     │
-│  T_M_Filler_Process           raw_wms_transactions           │
-│  [Change paper brik]          raw_wms_receive_item           │
-│  [Change strip]               raw_wms_receive_item_location  │
-│  [Down_log]                   stg_* / mart_* (dbt)          │
-│  t_log                                                       │
-└──────────────────┬───────────────────────────────────────────┘
-                   │
-         ┌─────────┴──────────┐
-         ▼                    ▼
-   Power BI               Budibase Apps
-   KPI dashboard          16+ apps, 100+ DAU
-   (director-level)
+┌─────────────────────┐   ┌──────────────────────────┐   ┌───────────────────┐
+│  DairyPlus Core     │   │  WMS Server              │   │  OPMS Server      │
+│  <internal-server>        │   │  <internal-server>             │   │  172.22.1.34      │
+│                     │   │  WMSDairyPlus2015        │   │  Sensor/temp data │
+│  PLC Hardware       │   │                          │   │  (planned ingest) │
+│  23 Tetra Pak       │   │  tbl_Transaction         │   └───────────────────┘
+│  fillers            │   │  tbl_ReceiveItem         │
+│     │               │   │  tbl_ReceiveItemLocation │
+│     ▼               │   │  mst_Product             │
+│  OPMS Application   │   └────────────┬─────────────┘
+│  writes machine     │                │
+│  state to SQL       │     Python ingest_wms.py
+│     │               │     every 5 min (Task Scheduler)
+│     ▼               │                │
+│  SQL Trigger V4     │                ▼
+│  sub-second capture │   ┌────────────────────────────────────────────────┐
+│     │               │   │              DB_BUDIBASE (central hub)         │
+│     ├──────────────────►│                                                │
+│                     │   │  dbo.*                    analytics.*          │
+└─────────────────────┘   │  ──────────────────        ─────────────────  │
+                          │  T_M_Filler_Process        raw_wms_*          │
+                          │  [Change paper brik]       stg_* (views)      │
+                          │  [Change strip]            mart_production     │
+                          │  Down_log                       _runs (table) │
+                          │  t_log                     mart_production     │
+                          │                                 _runs_view     │
+                          └───────────────┬────────────────────────────────┘
+                                          │  dbt run every 10 min
+                                          │  (Task Scheduler)
+                               ┌──────────┴──────────┐
+                               ▼                      ▼
+                         Power BI                Budibase Apps
+                         DirectQuery             16+ apps
+                         mart_production         100+ DAU
+                         _runs_view
 ```
 
 ---
 
-## Pipeline
+## Data Flow (5 layers)
 
-Replaces SQL Server triggers that caused race conditions and row locking under concurrent PLC writes at scale. The Python process owns the state machine explicitly — polling, diffing, routing events to handlers with in-memory cooldowns.
+```
+Layer 1 — Sources
+  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V4)
+  WMS Server → Python ingest → DB_BUDIBASE.analytics.raw_wms_*
 
-→ See [`pipeline/`](pipeline/) for full details.
+Layer 2 — Ingestion  (ingest_wms.py, every 5 min)
+  tbl_Transaction          ──incremental──► raw_wms_transactions
+  tbl_ReceiveItem          ──full reload──► raw_wms_receive_item
+  tbl_ReceiveItemLocation  ──incremental──► raw_wms_receive_item_location
+  mst_Product              ──full reload──► raw_wms_mst_product
+
+Layer 3 — dbt Staging  (views)
+  [Change paper brik] ──► stg_change_paper_brik
+  raw_wms_receive_item ──► stg_wms_receive_item
+  raw_wms_transactions + stg_wms_receive_item + raw_wms_mst_product ──► stg_wms_transactions
+  raw_wms_receive_item_location ──► stg_wms_receive_item_location
+
+Layer 4 — dbt Mart  (physical table, rebuilt every 10 min)
+  stg_change_paper_brik + stg_wms_transactions + stg_wms_receive_item_location
+      ──► mart_production_runs
+
+Layer 5 — Consumption  (view, always live)
+  mart_production_runs ──► mart_production_runs_view
+      Adds: week_label, date_status, waste_pct, waste_tba_pct, downtime_minutes
+      ──► Power BI DirectQuery (KPI dashboard, director level)
+```
 
 ---
 
@@ -78,17 +108,26 @@ For events that require sub-second capture (splice signals pulse in ~10ms — to
 
 ---
 
-## Dashboard
+## mart_production_runs — Column Reference
 
-Power BI report tracking production KPIs across all machines and plants. Data sourced directly from the factory SQL Server database.
-
-**KPIs tracked:**
-- Machine efficiency (FG output / TBA running hour)
-- Yield per batch (actual vs. expected)
-- Waste volume and category breakdown
-- Waste percentage trended over time
-
-→ See [`dashboard/`](dashboard/) for screenshots and DAX measures.
+| Column | Source | Formula |
+|---|---|---|
+| run_key | stg_change_paper_brik | YYYYMMDD + machine |
+| product_date | stg_change_paper_brik | Production date |
+| plan_production_date | stg_wms_transactions | Via ReceivedNo → receive_item |
+| start_time / end_time | stg_change_paper_brik | Splice time / end time |
+| run_duration_minutes | derived | DATEDIFF(minute, start, end) |
+| in_feed_mc / out_feed_mc | stg_change_paper_brik | TBA meter counts |
+| waste_tba | derived | in_feed_mc + 150 - out_feed_mc (live) / in_feed_mc - out_feed_mc (complete) |
+| scanned_briks | stg_change_paper_brik | Barcode scanner total |
+| waste_op | derived | scanned_briks - in_feed_mc |
+| transaction_briks | stg_wms_transactions | SUM(in_carton_amount × numbit) |
+| resend_briks | stg_wms_receive_item_location | SUM(resend_amount × numbit) |
+| fg_briks_amount | derived | transaction_briks - resend_briks |
+| waste_de | derived | out_feed_mc - fg_briks_amount |
+| efficiency | derived | fg_briks_amount / (run_duration_minutes × 400) |
+| downtime_count | stg_change_paper_brik | V4 trigger (0 if no stoppages) |
+| total_downtime_seconds | stg_change_paper_brik | V4 trigger (0 if no stoppages) |
 
 ---
 
@@ -97,7 +136,9 @@ Power BI report tracking production KPIs across all machines and plants. Data so
 | Layer | Technology |
 |-------|------------|
 | Event pipeline | Python 3.12, pyodbc |
-| Database | SQL Server (on-premise, 3 plants) |
-| BI / Reporting | Power BI Desktop + Gateway |
-| Source data | Tetra Pak PLC → SQL Server |
-| Deployment | Windows Task Scheduler |
+| WMS ingest | Python 3.12, pyodbc, watermark-based incremental |
+| Transformation | dbt-sqlserver |
+| Database | SQL Server (on-premise, 3 servers) |
+| BI / Reporting | Power BI — DirectQuery on mart view |
+| Orchestration | Windows Task Scheduler (Airflow planned) |
+| Source data | Tetra Pak PLC → OPMS → SQL Server |
