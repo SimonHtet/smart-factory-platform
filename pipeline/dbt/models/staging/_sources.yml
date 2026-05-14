@@ -1,0 +1,24 @@
+version: 2
+
+sources:
+  - name: dbo
+    database: DB_BUDIBASE
+    schema: dbo
+    tables:
+      - name: Change paper brik
+        description: Tetra Pak filler paper (brik) change events — one row per production run per filler
+      - name: t_log
+        description: General PLC event log
+
+  - name: analytics
+    database: DB_BUDIBASE
+    schema: analytics
+    tables:
+      - name: raw_wms_receive_item
+        description: WMS finished goods receive records — ingested via Python every 5 min from WMS SQL Server
+      - name: raw_wms_transactions
+        description: WMS transaction records (TransactionTypeId=1) — ingested via Python every 5 min from WMS SQL Server
+      - name: raw_wms_mst_product
+        description: WMS product master — ProductId + numbit (briks per carton), full reload each cycle
+      - name: raw_wms_receive_item_location
+        description: WMS resend records (TagType=1) — recall_amount per resend event, ingested via Python

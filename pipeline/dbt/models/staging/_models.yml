@@ -1,0 +1,48 @@
+version: 2
+
+models:
+  - name: stg_change_paper_brik
+    description: Cleaned paper brik change events — waste derived as out_feed_mc - in_feed_mc, splicing_time_1 aliased as start_time
+    columns:
+      - name: id
+        tests:
+          - not_null
+          - unique
+      - name: product_date
+        tests:
+          - not_null
+      - name: machine
+        tests:
+          - not_null
+      - name: scanned_briks
+        tests:
+          - not_null
+      - name: downtime_count
+        description: Number of times machine hit step 8 (minor stoppage) this batch — NULL if no stoppages or batch aborted
+      - name: total_downtime_seconds
+        description: Cumulative downtime in seconds across all stoppages this batch — NULL if no stoppages or batch aborted
+
+  - name: stg_t_log
+    description: General PLC event log
+    columns:
+      - name: logged_at
+        tests:
+          - not_null
+
+  - name: stg_wms_receive_item
+    description: WMS finished goods receive records — Z2 excluded, run_key bridges to production via plan_production_date + filler_code
+    columns:
+      - name: run_key
+        description: Bridge key — CONVERT(varchar, plan_production_date, 112) + filler_code, e.g. 20260513M3
+        tests:
+          - not_null
+
+  - name: stg_wms_transactions
+    description: WMS transactions (type 1) — Z2 excluded, joined to stg_wms_receive_item via received_no to resolve plan_production_date and run_key
+    columns:
+      - name: received_no
+        description: Foreign key to stg_wms_receive_item
+        tests:
+          - not_null
+      - name: run_key
+        description: Bridge key derived from stg_wms_receive_item.plan_production_date + filler_code, e.g. 20260513M3
