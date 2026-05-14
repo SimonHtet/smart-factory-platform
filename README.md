@@ -23,13 +23,13 @@ Built in-house to replace a ฿3M+ vendor quote for custom MES trigger logic and
 PLC Hardware (23 Tetra Pak fillers)
     │
     ▼
-OPMS Server (<internal-server>) — Tetra Pak proprietary system
+OPMS Server (172.22.x.x) — Tetra Pak proprietary system
   Collects PLC machine state in real time.
   Read-only access — vendor-owned, cannot create tables here.
   OPMS writes machine state directly into DB_BUDIBASE.dbo.T_M_Filler_Process.
     │
     ▼
-WMS Server (<internal-server>) — WMSDairyPlus2015
+WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
   Read-only access — must pull data into DB_BUDIBASE to transform.
     │
@@ -38,7 +38,7 @@ WMS Server (<internal-server>) — WMSDairyPlus2015
     │  (Task Scheduler)              T_M_Filler_Process
     ▼                                (event-driven, sub-second)
 ┌──────────────────────────────────────────────────────────────────┐
-│                  DB_BUDIBASE  <internal-server>  (db_owner)            │
+│                  DB_BUDIBASE  172.22.x.x  (db_owner)            │
 │  Only server where Simon can create tables and run dbt.          │
 │  All cross-system joins happen here after data lands.            │
 │                                                                  │
