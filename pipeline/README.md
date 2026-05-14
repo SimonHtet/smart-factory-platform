@@ -22,11 +22,16 @@ The Python pipeline takes the trigger logic entirely out of SQL Server and runs 
 ## Architecture
 
 ```
-PLC Hardware
+PLC Hardware (23 Tetra Pak fillers)
     │
     ▼
-T_M_Filler_Process          ← Raw table written by PLCs directly
-    │                          (one row per machine, updated in place)
+OPMS Server (172.22.x.x) — Tetra Pak proprietary system
+  Collects all PLC machine state in real time.
+  Writes machine state rows into DB_BUDIBASE on every state change.
+    │
+    ▼
+T_M_Filler_Process          ← Written by OPMS (one row per machine, updated in place)
+    │
     │  SELECT * every 1s
     ▼
 Python Poller (main.py)
