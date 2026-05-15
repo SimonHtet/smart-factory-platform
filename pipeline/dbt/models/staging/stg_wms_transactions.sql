@@ -1,3 +1,11 @@
+with deduped as (
+    select distinct
+        ReceivedNo, ProductId, ProductionDate, InCartonAmount,
+        CreateDate, MachineCode, GroupCode, filler_code
+    from {{ source('analytics', 'raw_wms_transactions') }}
+    where filler_code != 'Z2'
+)
+
 select
     t.ReceivedNo                                                as received_no,
     t.ProductId                                                 as product_id,
@@ -12,9 +20,8 @@ select
         + t.filler_code                                         as run_key,
     TRY_CAST(t.InCartonAmount as decimal(18,2))
         * TRY_CAST(mp.numbit as decimal(18,2))                  as total_briks_amount
-from {{ source('analytics', 'raw_wms_transactions') }} t
+from deduped t
 left join {{ ref('stg_wms_receive_item') }} ri
     on t.ReceivedNo = ri.received_no
 left join {{ source('analytics', 'raw_wms_mst_product') }} mp
     on t.ProductId = mp.ProductId
-where t.filler_code != 'Z2'

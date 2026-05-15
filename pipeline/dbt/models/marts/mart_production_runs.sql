@@ -69,6 +69,11 @@ select
     (w.transaction_briks - ISNULL(r.resend_briks, 0))
         / NULLIF(p.run_duration_minutes * 400.0, 0)            as efficiency,
 
+    -- targets
+    CASE WHEN p.machine LIKE 'M%'
+         THEN p.out_feed_mc * 0.0044
+    END                                                             as tba_target,
+
     -- downtime
     p.downtime_count,
     p.total_downtime_seconds
