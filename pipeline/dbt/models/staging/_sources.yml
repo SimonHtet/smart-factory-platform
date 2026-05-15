@@ -9,6 +9,8 @@ sources:
         description: Tetra Pak filler paper (brik) change events — one row per production run per filler
       - name: t_log
         description: General PLC event log
+      - name: T_M_Filler_Process
+        description: Live PLC machine state — one row per machine, updated in real time by OPMS
 
   - name: analytics
     database: DB_BUDIBASE
