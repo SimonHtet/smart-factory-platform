@@ -58,7 +58,7 @@ select
     CASE
         WHEN CAST(m.product_date AS DATE) = CAST(GETUTCDATE() AS DATE)
         THEN 'Today'
-        ELSE CONVERT(varchar, CAST(m.product_date AS DATE), 106)
+        ELSE CONVERT(varchar, CAST(m.product_date AS DATE), 111)
     END                                                             as date_status,
 
     -- derived KPIs
@@ -73,6 +73,10 @@ select
         / NULLIF(CAST(CASE WHEN m.end_time IS NULL THEN p.Counter_Outfeed ELSE m.out_feed_mc END AS float), 0)
                                                                     as waste_tba_pct,
 
+    CAST(CASE WHEN m.end_time IS NULL THEN m.scanned_briks - p.Counter_infeed ELSE m.waste_op END AS float)
+        / NULLIF(CAST(CASE WHEN m.end_time IS NULL THEN p.Counter_Outfeed ELSE m.out_feed_mc END AS float), 0)
+                                                                    as waste_op_pct,
+
     CASE
         WHEN m.end_time IS NOT NULL THEN m.run_duration_minutes
         ELSE DATEDIFF(minute, m.start_time, GETUTCDATE())
@@ -82,7 +86,24 @@ select
         WHEN m.end_time IS NOT NULL THEN m.efficiency
         ELSE CAST(p.Counter_Outfeed AS float)
              / NULLIF(DATEDIFF(minute, m.start_time, GETUTCDATE()) * 400.0, 0)
-    END                                                             as efficiency_live
+    END                                                             as efficiency_live,
+
+    -- OEE loss components (quality loss already tracked via waste metrics)
+    CASE
+        WHEN m.end_time IS NOT NULL
+        THEN 1.0 - (m.run_duration_minutes - m.total_downtime_seconds / 60.0)
+             / NULLIF(CAST(m.run_duration_minutes AS float), 0)
+        ELSE 1.0 - (DATEDIFF(minute, m.start_time, GETUTCDATE()) - m.total_downtime_seconds / 60.0)
+             / NULLIF(CAST(DATEDIFF(minute, m.start_time, GETUTCDATE()) AS float), 0)
+    END                                                             as availability_loss,
+
+    CASE
+        WHEN m.end_time IS NOT NULL
+        THEN 1.0 - CAST(m.out_feed_mc AS float)
+             / NULLIF((m.run_duration_minutes - m.total_downtime_seconds / 60.0) * 400.0, 0)
+        ELSE 1.0 - CAST(p.Counter_Outfeed AS float)
+             / NULLIF((DATEDIFF(minute, m.start_time, GETUTCDATE()) - m.total_downtime_seconds / 60.0) * 400.0, 0)
+    END                                                             as performance_loss
 
 from {{ ref('mart_production_runs') }} m
 left join {{ source('dbo', 'T_M_Filler_Process') }} p
