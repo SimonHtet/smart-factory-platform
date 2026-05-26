@@ -1,9 +1,16 @@
 -- ============================================================
--- TRI_UPDATE_FILLER_V5
+-- TRI_UPDATE_FILLER_V5.1
 -- Database : DB_BUDIBASE
 -- Table    : T_M_Filler_Process
--- Deployed : 2026-05-16
+-- Deployed : 2026-05-26
 -- Author   : Simon (DairyPlus Manufacturing Systems Engineer)
+--
+-- WHAT CHANGED IN V5.1
+-- -------------------------------------------------------
+-- Group M CIP signal is now online.
+-- Extended all CIP end-time logic (Step 14 + Signal_Final_CIP=1)
+-- and End Roll active-batch lookup to include Machine LIKE 'M%',
+-- matching the existing A/D behaviour exactly.
 --
 -- WHAT CHANGED FROM V4
 -- -------------------------------------------------------
@@ -23,7 +30,7 @@
 -- -------------------------------------------------------
 --   Step 10           -> Splicing loop started
 --   Step 13           -> Splicing loop ended; counter snapshot
---   Step 14 + CIP=1   -> CIP end (Machine A/D only); 1-hr cooldown
+--   Step 14 + CIP=1   -> CIP end (Machine A/D/M); 1-hr cooldown
 --   End roll 0->1     -> Paper roll splice; 30-s cooldown
 --   Strip signal 0->1 -> Strip splice; 30-s cooldown
 --   Step 11 -> 8      -> Downtime START: stamp timer, init accumulator
@@ -73,7 +80,7 @@
 
 USE [DB_BUDIBASE]
 GO
-CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_FILLER_V5]
+CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_FILLER_V5_1]
 ON [dbo].[T_M_Filler_Process]
 AFTER UPDATE
 AS
@@ -149,7 +156,7 @@ BEGIN
             SELECT 1 FROM inserted
             WHERE Machine_Step_No = 14
             AND Signal_Final_CIP = 1
-            AND (Machine LIKE 'A%' OR Machine LIKE 'D%')
+            AND (Machine LIKE 'A%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
         )
         BEGIN
             DECLARE @cur_Machine_S14   NVARCHAR(50)
@@ -163,7 +170,7 @@ BEGIN
                 FROM inserted
                 WHERE Machine_Step_No = 14
                 AND Signal_Final_CIP = 1
-                AND (Machine LIKE 'A%' OR Machine LIKE 'D%')
+                AND (Machine LIKE 'A%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
 
             OPEN step14_cursor
             FETCH NEXT FROM step14_cursor INTO @cur_Machine_S14
@@ -250,7 +257,7 @@ BEGIN
 
             WHILE @@FETCH_STATUS = 0
             BEGIN
-                IF @cur_Machine_ER LIKE 'A%' OR @cur_Machine_ER LIKE 'D%'
+                IF @cur_Machine_ER LIKE 'A%' OR @cur_Machine_ER LIKE 'D%' OR @cur_Machine_ER LIKE 'M%'
                 BEGIN
                     SELECT @GID = MAX(ID)
                     FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
