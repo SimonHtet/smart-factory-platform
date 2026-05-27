@@ -1,9 +1,18 @@
 -- ============================================================
--- TRI_UPDATE_FILLER_V5.1
+-- TRI_UPDATE_FILLER_V5.2
 -- Database : DB_BUDIBASE
 -- Table    : T_M_Filler_Process
--- Deployed : 2026-05-26
+-- Deployed : 2026-05-27
 -- Author   : Simon (DairyPlus Manufacturing Systems Engineer)
+--
+-- WHAT CHANGED IN V5.2
+-- -------------------------------------------------------
+-- End Roll and Strip splice signals are now gated on Step 11.
+-- If the operator feeds paper before the machine reaches full
+-- production (Step 11), the signal is ignored — no premature
+-- write to Splicing time 2+.
+-- Both cursors (endroll_cursor, strip_cursor) gain:
+--   AND i.Machine_Step_No = 11
 --
 -- WHAT CHANGED IN V5.1
 -- -------------------------------------------------------
@@ -80,7 +89,7 @@
 
 USE [DB_BUDIBASE]
 GO
-CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_FILLER_V5_1]
+CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_FILLER_V5_2]
 ON [dbo].[T_M_Filler_Process]
 AFTER UPDATE
 AS
@@ -251,6 +260,7 @@ BEGIN
                 JOIN deleted d ON i.Machine = d.Machine
                 WHERE i.Paper_Splicing_End_roll_Signal_Brik = 1
                 AND d.Paper_Splicing_End_roll_Signal_Brik = 0
+                AND i.Machine_Step_No = 11
 
             OPEN endroll_cursor
             FETCH NEXT FROM endroll_cursor INTO @cur_Machine_ER
@@ -330,6 +340,7 @@ BEGIN
                 JOIN deleted d ON i.Machine = d.Machine
                 WHERE i.Strip_Splicing_Signal_Strip = 1
                 AND d.Strip_Splicing_Signal_Strip = 0
+                AND i.Machine_Step_No = 11
 
             OPEN strip_cursor
             FETCH NEXT FROM strip_cursor INTO @cur_Machine_ST
