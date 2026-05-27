@@ -33,7 +33,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
   Read-only access — must pull data into DB_BUDIBASE to transform.
     │
-    │  Python ingest_wms.py          SQL Trigger V5.1
+    │  Python ingest_wms.py          SQL Trigger V5.2
     │  every 5 min                   fires on every write to
     │  (Task Scheduler)              T_M_Filler_Process
     ▼                                (event-driven, sub-second)
@@ -64,7 +64,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
 
 ```
 Layer 1 — Sources
-  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V5.1)
+  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V5.2)
   WMS Server → Python ingest → DB_BUDIBASE.analytics.raw_wms_*
 
 Layer 2 — Ingestion  (ingest_wms.py, every 5 min)
@@ -91,9 +91,9 @@ Layer 5 — Consumption  (view, always live)
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.1
+## SQL Trigger — TRI_UPDATE_FILLER_V5.2
 
-For events that require sub-second capture (splice signals pulse in ~10ms — too fast for a 1-second Python poll), a SQL trigger runs alongside the Python pipeline. V5.1 tracks each recovery step individually and adds Group M CIP support.
+For events that require sub-second capture (splice signals pulse in ~10ms — too fast for a 1-second Python poll), a SQL trigger runs alongside the Python pipeline. V5.2 tracks each recovery step individually, adds Group M CIP support, and gates splice signals on Step 11 to prevent premature writes.
 
 **Downtime events logged to `[Down_log]`:**
 
@@ -107,7 +107,7 @@ For events that require sub-second capture (splice signals pulse in ~10ms — to
 
 > `[Down_log]` is a structured audit table — queryable per machine/batch unlike the raw text in `t_log`. "Breakdown" in company terms means >30 min; that classification is applied at the reporting layer from `Total_Downtime_Seconds`.
 
-→ See [`pipeline/sql/TRI_UPDATE_FILLER_V5.1.sql`](pipeline/sql/TRI_UPDATE_FILLER_V5.1.sql)
+→ See [`pipeline/sql/TRI_UPDATE_FILLER_V5.2.sql`](pipeline/sql/TRI_UPDATE_FILLER_V5.2.sql)
 
 ---
 
