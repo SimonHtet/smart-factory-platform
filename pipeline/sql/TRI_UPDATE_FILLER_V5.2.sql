@@ -190,6 +190,7 @@ BEGIN
                 FROM [Change paper brik]
                 WHERE Machine = @cur_Machine_S14
                 AND [end time] IS NOT NULL
+                AND End_time_CIP IS NULL
 
                 IF @GID_S14 IS NOT NULL
                 BEGIN
