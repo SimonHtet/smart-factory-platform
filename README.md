@@ -33,7 +33,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
   Read-only access — must pull data into DB_BUDIBASE to transform.
     │
-    │  Python ingest_wms.py          SQL Trigger V4
+    │  Python ingest_wms.py          SQL Trigger V5.1
     │  every 5 min                   fires on every write to
     │  (Task Scheduler)              T_M_Filler_Process
     ▼                                (event-driven, sub-second)
@@ -64,7 +64,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
 
 ```
 Layer 1 — Sources
-  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V4)
+  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V5.1)
   WMS Server → Python ingest → DB_BUDIBASE.analytics.raw_wms_*
 
 Layer 2 — Ingestion  (ingest_wms.py, every 5 min)
@@ -91,21 +91,23 @@ Layer 5 — Consumption  (view, always live)
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V4
+## SQL Trigger — TRI_UPDATE_FILLER_V5.1
 
-For events that require sub-second capture (splice signals pulse in ~10ms — too fast for a 1-second Python poll), a SQL trigger runs alongside the Python pipeline. V4 adds downtime tracking on top of the splice/CIP logic from V3.
+For events that require sub-second capture (splice signals pulse in ~10ms — too fast for a 1-second Python poll), a SQL trigger runs alongside the Python pipeline. V5.1 tracks each recovery step individually and adds Group M CIP support.
 
 **Downtime events logged to `[Down_log]`:**
 
 | Transition | Event | What's recorded |
 |---|---|---|
 | Step 11 → 8 | `START` | Machine, Batch_ID, stop count |
-| Step 8 → 9 | `END` | Duration in seconds, cumulative total |
-| Step 8 → 7 | `ABORT` | In-progress stop undone — previous valid stops preserved |
+| Step 8 → 9 | `SEGMENT` | Step-8 dwell duration, cumulative total |
+| Step 9 → 10 | `SEGMENT` | Step-9 dwell duration, cumulative total |
+| Step 10 → 11 | `END` | Step-10 warmup duration, event closed |
+| Step 8/9/10 → 7 | `ABORT` | Full event rolled back via Current_Event_Seconds |
 
 > `[Down_log]` is a structured audit table — queryable per machine/batch unlike the raw text in `t_log`. "Breakdown" in company terms means >30 min; that classification is applied at the reporting layer from `Total_Downtime_Seconds`.
 
-→ See [`pipeline/sql/TRI_UPDATE_FILLER_V4.sql`](pipeline/sql/TRI_UPDATE_FILLER_V4.sql)
+→ See [`pipeline/sql/TRI_UPDATE_FILLER_V5.1.sql`](pipeline/sql/TRI_UPDATE_FILLER_V5.1.sql)
 
 ---
 
