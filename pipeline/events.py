@@ -88,7 +88,7 @@ def handle_step14_cip(machine, cooldown_log, conn):
         UPDATE [Change paper brik]
         SET End_time_CIP = ?
         WHERE ID = ?
-    """, end_time, gid)
+    """, now, gid)
 
     cursor.execute("""
         INSERT INTO [endtime_log_test] (Machine, Step, Signal_CIP, Outfeed, End_Time, Log_Time)
@@ -97,7 +97,7 @@ def handle_step14_cip(machine, cooldown_log, conn):
 
     cursor.execute("""
         INSERT INTO t_log (txt) VALUES (?)
-    """, f"{machine}_S14:CIP=1:ID={gid}:Outfeed={outfeed}:EndTime={end_time}-PYTHON")
+    """, f"{machine}_S14:CIP=1:ID={gid}:Outfeed={outfeed}:BatchEndTime={end_time}:CIPTime={now}-PYTHON")
 
     conn.commit()
     cooldown_log[machine] = now
