@@ -130,18 +130,8 @@ BEGIN
         BEGIN
             UPDATE tpr
             SET
-                tpr.end_time_cip         = ISNULL(cpb.[End_time_CIP], GETUTCDATE()),
-                tpr.run_duration_minutes = DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())),
-                tpr.efficiency_outfeed   = CASE
-                    WHEN tpr.out_feed_mc   > 0 THEN tpr.out_feed_mc   / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
-                    ELSE tpr.efficiency_outfeed
-                END,
-                tpr.efficiency_scanned   = CASE
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
-                    ELSE tpr.efficiency_scanned
-                END,
-                tpr.last_updated         = GETUTCDATE()
+                tpr.end_time_cip = ISNULL(cpb.[End_time_CIP], GETUTCDATE()),
+                tpr.last_updated = GETUTCDATE()
             FROM [analytics].[temp_production_run] tpr
             JOIN inserted i ON tpr.machine = i.Machine
             CROSS APPLY (
