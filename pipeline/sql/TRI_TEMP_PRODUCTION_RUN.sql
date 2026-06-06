@@ -23,7 +23,7 @@
 /*
 CREATE TABLE [analytics].[temp_production_run] (
     run_key                  VARCHAR(20)  NOT NULL PRIMARY KEY,
-    machine                  NVARCHAR(50),
+    machine                  NVARCHAR(50) NOT NULL,
     product_date             DATE,
     product_id               NVARCHAR(100),
     start_time               DATETIME,
