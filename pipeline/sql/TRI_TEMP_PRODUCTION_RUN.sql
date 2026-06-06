@@ -125,25 +125,34 @@ BEGIN
 
         -- -------------------------------------------------------
         -- STEP 13 : write end_time + final run_duration
+        -- Reads [end time] from [Change paper brik] (written by
+        -- TRI_UPDATE_FILLER_V5.3). Falls back to GETUTCDATE() if
+        -- V5.3 hasn't fired yet in this transaction.
         -- -------------------------------------------------------
         IF EXISTS (SELECT 1 FROM inserted WHERE Machine_Step_No = 13)
         BEGIN
             UPDATE tpr
             SET
-                tpr.end_time             = GETUTCDATE(),
-                tpr.run_duration_minutes = DATEDIFF(minute, tpr.start_time, GETUTCDATE()),
+                tpr.end_time             = ISNULL(cpb.[end time], GETUTCDATE()),
+                tpr.run_duration_minutes = DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[end time], GETUTCDATE())),
                 tpr.efficiency_outfeed   = CASE
-                    WHEN tpr.out_feed_mc   > 0 THEN tpr.out_feed_mc   / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
+                    WHEN tpr.out_feed_mc   > 0 THEN tpr.out_feed_mc   / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[end time], GETUTCDATE())), 0) * 400.0)
+                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[end time], GETUTCDATE())), 0) * 400.0)
                     ELSE tpr.efficiency_outfeed
                 END,
                 tpr.efficiency_scanned   = CASE
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
+                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[end time], GETUTCDATE())), 0) * 400.0)
                     ELSE tpr.efficiency_scanned
                 END,
                 tpr.last_updated         = GETUTCDATE()
             FROM [analytics].[temp_production_run] tpr
             JOIN inserted i ON tpr.machine = i.Machine
+            CROSS APPLY (
+                SELECT TOP 1 [end time]
+                FROM [dbo].[Change paper brik]
+                WHERE Machine = i.Machine
+                ORDER BY ID DESC
+            ) cpb
             WHERE i.Machine_Step_No = 13
               AND tpr.end_time IS NULL
               AND tpr.start_time IS NOT NULL;
@@ -152,6 +161,9 @@ BEGIN
         -- -------------------------------------------------------
         -- STEP 14 + CIP : write end_time_cip + final run_duration
         -- A/D/M machines only.
+        -- Reads [End_time_CIP] from [Change paper brik] (written by
+        -- TRI_UPDATE_FILLER_V5.3). Falls back to GETUTCDATE() if
+        -- V5.3 hasn't fired yet in this transaction.
         -- -------------------------------------------------------
         IF EXISTS (
             SELECT 1 FROM inserted
@@ -162,20 +174,26 @@ BEGIN
         BEGIN
             UPDATE tpr
             SET
-                tpr.end_time_cip         = GETUTCDATE(),
-                tpr.run_duration_minutes = DATEDIFF(minute, tpr.start_time, GETUTCDATE()),
+                tpr.end_time_cip         = ISNULL(cpb.[End_time_CIP], GETUTCDATE()),
+                tpr.run_duration_minutes = DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())),
                 tpr.efficiency_outfeed   = CASE
-                    WHEN tpr.out_feed_mc   > 0 THEN tpr.out_feed_mc   / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
+                    WHEN tpr.out_feed_mc   > 0 THEN tpr.out_feed_mc   / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
+                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
                     ELSE tpr.efficiency_outfeed
                 END,
                 tpr.efficiency_scanned   = CASE
-                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, GETUTCDATE()), 0) * 400.0)
+                    WHEN tpr.scanned_briks > 0 THEN tpr.scanned_briks / (NULLIF(DATEDIFF(minute, tpr.start_time, ISNULL(cpb.[End_time_CIP], GETUTCDATE())), 0) * 400.0)
                     ELSE tpr.efficiency_scanned
                 END,
                 tpr.last_updated         = GETUTCDATE()
             FROM [analytics].[temp_production_run] tpr
             JOIN inserted i ON tpr.machine = i.Machine
+            CROSS APPLY (
+                SELECT TOP 1 [End_time_CIP]
+                FROM [dbo].[Change paper brik]
+                WHERE Machine = i.Machine
+                ORDER BY ID DESC
+            ) cpb
             WHERE i.Machine_Step_No = 14
               AND i.Signal_Final_CIP = 1
               AND (i.Machine LIKE 'A%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
@@ -222,8 +240,9 @@ BEGIN
 
         WHEN MATCHED THEN UPDATE SET
 
-            tgt.end_time               = src.end_time,
-            tgt.end_time_cip           = src.end_time_cip,
+            -- End-time lock: once set by Step 13/14 blocks, never overwrite
+            tgt.end_time     = CASE WHEN tgt.end_time     IS NOT NULL THEN tgt.end_time     ELSE src.end_time     END,
+            tgt.end_time_cip = CASE WHEN tgt.end_time_cip IS NOT NULL THEN tgt.end_time_cip ELSE src.end_time_cip END,
             tgt.run_duration_minutes   = src.run_duration_minutes,
             tgt.scanned_briks          = src.scanned_briks,
             tgt.downtime_count         = src.downtime_count,
