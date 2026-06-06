@@ -11,9 +11,29 @@ Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and
 | Folder | Description |
 |--------|-------------|
 | [`pipeline/`](pipeline/) | Python event pipeline — polls PLC data at 1-second intervals, processes machine step transitions |
-| [`pipeline/dbt/`](pipeline/dbt/) | dbt transformation layer — staging models, mart, and WMS ingest scripts |
-| [`dashboard/`](dashboard/) | Power BI KPI dashboard — machine efficiency, yield, waste analysis, reviewed at director level |
+| [`pipeline/sql/`](pipeline/sql/) | SQL triggers and utility scripts (see table below) |
+| [`dashboard/`](dashboard/) | Power BI KPI dashboard — machine efficiency, yield, waste, reviewed at director level |
 | [`notebooks/`](notebooks/) | Predictive maintenance prototype — scikit-learn on OPMS sensor data |
+
+### SQL Files
+
+| File | Purpose |
+|------|---------|
+| `TRI_UPDATE_FILLER_V5.3.sql` | Main event trigger on `T_M_Filler_Process` — splice tracking, downtime segments, CIP end time |
+| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker (see note below) |
+| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual |
+
+---
+
+## Current Status — WMS Ingest Paused
+
+`ingest_wms.py` is currently paused pending IT security review and formal approval under the internal change management process (DTO-SOP-001). While that's in progress, `mart_production_runs` (which depends on WMS data) is unavailable as the live Power BI source.
+
+**Temporary solution: `analytics.temp_production_run`**
+
+A SQL trigger (`TRI_TEMP_PRODUCTION_RUN`) on `T_M_Filler_Process` builds a WMS-free production run table in real time — tracking efficiency, waste, and downtime without the FG/WMS columns. Power BI points here until WMS ingest is restored.
+
+Once IT approval comes through, WMS ingest resumes and Power BI reverts to `mart_production_runs_view`.
 
 ---
 
@@ -25,112 +45,98 @@ PLC Hardware (23 Tetra Pak fillers)
     ▼
 OPMS Server (172.22.x.x) — Tetra Pak proprietary system
   Collects PLC machine state in real time.
-  Read-only access — vendor-owned, cannot create tables here.
-  OPMS writes machine state directly into DB_BUDIBASE.dbo.T_M_Filler_Process.
+  Read-only access — OPMS writes directly into DB_BUDIBASE.dbo.T_M_Filler_Process.
     │
     ▼
 WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
-  Read-only access — must pull data into DB_BUDIBASE to transform.
+  Read-only access.  [INGEST PAUSED — IT security review]
     │
-    │  Python ingest_wms.py          SQL Trigger V5.2
-    │  every 5 min                   fires on every write to
-    │  (Task Scheduler)              T_M_Filler_Process
-    ▼                                (event-driven, sub-second)
-┌──────────────────────────────────────────────────────────────────┐
-│                  DB_BUDIBASE  172.22.x.x  (db_owner)            │
-│  Only server where Simon can create tables and run dbt.          │
-│  All cross-system joins happen here after data lands.            │
-│                                                                  │
-│  dbo.*                          analytics.*                      │
-│  ──────────────────             ────────────────────────────     │
-│  T_M_Filler_Process             raw_wms_*  (ingest landing)      │
-│  [Change paper brik]            stg_*      (dbt views)           │
-│  Down_log                       mart_production_runs  (table)    │
-│  t_log                          mart_production_runs_view        │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │  dbt run every 10 min (Task Scheduler)
+    │  SQL Trigger V5.3               Python ingest_wms.py
+    │  fires on T_M_Filler_Process    every 5 min via Task Scheduler
+    │  (event-driven, sub-second)     [PAUSED]
+    ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 DB_BUDIBASE  172.22.x.x  (db_owner)            │
+│                                                                 │
+│  dbo.*                         analytics.*                      │
+│  ──────────────────            ─────────────────────────────    │
+│  T_M_Filler_Process            temp_production_run  ◄── live    │
+│  [Change paper brik]           v_group_production_run           │
+│  Down_log                      raw_wms_*  (ingest landing)      │
+│  t_log                         stg_*  (dbt views)               │
+│                                mart_production_runs  (paused)   │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
             ┌──────────┴──────────┐
             ▼                     ▼
       Power BI               Budibase Apps
-      DirectQuery            16+ apps, 100+ DAU
-      mart_production
-      _runs_view
+      temp_production_run    16+ apps, 100+ DAU
+      (temporary source)
 ```
 
 ---
 
-## Data Flow (5 layers)
+## Data Flow
 
+**Normal (WMS active):**
 ```
-Layer 1 — Sources
-  PLC → OPMS app → DB_BUDIBASE.dbo (via SQL Trigger V5.2)
-  WMS Server → Python ingest → DB_BUDIBASE.analytics.raw_wms_*
+PLC → T_M_Filler_Process → [Change paper brik]  ─┐
+WMS → raw_wms_*                                   ├─► mart_production_runs ──► Power BI
+                                                  ┘   (dbt, every 10 min)
+```
 
-Layer 2 — Ingestion  (ingest_wms.py, every 5 min)
-  tbl_Transaction          ──incremental──► raw_wms_transactions
-  tbl_ReceiveItem          ──full reload──► raw_wms_receive_item
-  tbl_ReceiveItemLocation  ──incremental──► raw_wms_receive_item_location
-  mst_Product              ──full reload──► raw_wms_mst_product
-
-Layer 3 — dbt Staging  (views)
-  [Change paper brik] ──► stg_change_paper_brik
-  raw_wms_receive_item ──► stg_wms_receive_item
-  raw_wms_transactions + stg_wms_receive_item + raw_wms_mst_product ──► stg_wms_transactions
-  raw_wms_receive_item_location ──► stg_wms_receive_item_location
-
-Layer 4 — dbt Mart  (physical table, rebuilt every 10 min)
-  stg_change_paper_brik + stg_wms_transactions + stg_wms_receive_item_location
-      ──► mart_production_runs
-
-Layer 5 — Consumption  (view, always live)
-  mart_production_runs ──► mart_production_runs_view
-      Adds: week_label, date_status, waste_pct, waste_tba_pct, downtime_minutes
-      ──► Power BI DirectQuery (KPI dashboard, director level)
+**Current (WMS paused):**
+```
+PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
+         (TRI_TEMP_PRODUCTION_RUN, event-driven)
 ```
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.2
+## SQL Trigger — TRI_UPDATE_FILLER_V5.3
 
-For events that require sub-second capture (splice signals pulse in ~10ms — too fast for a 1-second Python poll), a SQL trigger runs alongside the Python pipeline. V5.2 tracks each recovery step individually, adds Group M CIP support, and gates splice signals on Step 11 to prevent premature writes.
+Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table.
 
-**Downtime events logged to `[Down_log]`:**
+**Events handled:**
 
-| Transition | Event | What's recorded |
+| Transition | Event | Action |
 |---|---|---|
-| Step 11 → 8 | `START` | Machine, Batch_ID, stop count |
-| Step 8 → 9 | `SEGMENT` | Step-8 dwell duration, cumulative total |
-| Step 9 → 10 | `SEGMENT` | Step-9 dwell duration, cumulative total |
-| Step 10 → 11 | `END` | Step-10 warmup duration, event closed |
-| Step 8/9/10 → 7 | `ABORT` | Full event rolled back via Current_Event_Seconds |
+| Step 10 | splice signal 0→1 | Write `Splicing time 1` |
+| Step 13 | — | Write `end time`, `In_Feed_MC`, `Out_Feed_MC` |
+| Step 14 + CIP=1 | A/D/M only | Write `End_time_CIP` (1-hour cooldown) |
+| Step 11 → 8 | `START` | Increment `Downtime_Count`, stamp timer |
+| Step 8 → 9 | `SEGMENT` | Log step-8 duration, reset timer |
+| Step 9 → 10 | `SEGMENT` | Log step-9 duration, reset timer |
+| Step 10 → 11 | `END` | Log step-10 warmup, close event |
+| Step 8/9/10 → 7 | `ABORT` | Roll back via `Current_Event_Seconds` |
 
-> `[Down_log]` is a structured audit table — queryable per machine/batch unlike the raw text in `t_log`. "Breakdown" in company terms means >30 min; that classification is applied at the reporting layer from `Total_Downtime_Seconds`.
-
-→ See [`pipeline/sql/TRI_UPDATE_FILLER_V5.2.sql`](pipeline/sql/TRI_UPDATE_FILLER_V5.2.sql)
+> "Breakdown" in company terms means >30 min — that classification is applied at the reporting layer, not in the trigger.
 
 ---
 
 ## mart_production_runs — Column Reference
 
+*(Full mart available when WMS ingest is active)*
+
 | Column | Source | Formula |
 |---|---|---|
-| run_key | stg_change_paper_brik | YYYYMMDD + machine |
-| product_date | stg_change_paper_brik | Production date |
+| run_key | [Change paper brik] | YYYYMMDD + machine |
+| product_date | [Change paper brik] | Production date |
 | plan_production_date | stg_wms_transactions | Via ReceivedNo → receive_item |
-| start_time / end_time | stg_change_paper_brik | Splice time / end time |
+| start_time / end_time | [Change paper brik] | Splice time / end time |
 | run_duration_minutes | derived | DATEDIFF(minute, start, end) |
-| in_feed_mc / out_feed_mc | stg_change_paper_brik | TBA meter counts |
-| waste_tba | derived | in_feed_mc + 150 - out_feed_mc (live) / in_feed_mc - out_feed_mc (complete) |
-| scanned_briks | stg_change_paper_brik | Barcode scanner total |
-| waste_op | derived | scanned_briks - in_feed_mc |
+| in_feed_mc / out_feed_mc | [Change paper brik] | TBA meter counts |
+| waste_tba | derived | in_feed_mc − out_feed_mc |
+| scanned_briks | [Change paper brik] | Barcode scanner total |
+| waste_op | derived | scanned_briks − in_feed_mc |
 | transaction_briks | stg_wms_transactions | SUM(in_carton_amount × numbit) |
 | resend_briks | stg_wms_receive_item_location | SUM(resend_amount × numbit) |
-| fg_briks_amount | derived | transaction_briks - resend_briks |
-| waste_de | derived | out_feed_mc - fg_briks_amount |
+| fg_briks_amount | derived | transaction_briks − resend_briks |
+| waste_de | derived | out_feed_mc − fg_briks_amount |
 | efficiency | derived | fg_briks_amount / (run_duration_minutes × 400) |
-| downtime_count | stg_change_paper_brik | V4 trigger (0 if no stoppages) |
-| total_downtime_seconds | stg_change_paper_brik | V4 trigger (0 if no stoppages) |
+| downtime_count | [Change paper brik] | V5.3 trigger |
+| total_downtime_seconds | [Change paper brik] | V5.3 trigger |
 
 ---
 
@@ -142,6 +148,6 @@ For events that require sub-second capture (splice signals pulse in ~10ms — to
 | WMS ingest | Python 3.12, pyodbc, watermark-based incremental |
 | Transformation | dbt-sqlserver |
 | Database | SQL Server (on-premise, 3 servers) |
-| BI / Reporting | Power BI — DirectQuery on mart view |
+| BI / Reporting | Power BI — DirectQuery |
 | Orchestration | Windows Task Scheduler (Airflow planned) |
 | Source data | Tetra Pak PLC → OPMS → SQL Server |
