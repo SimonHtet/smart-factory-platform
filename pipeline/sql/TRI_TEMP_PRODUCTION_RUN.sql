@@ -23,7 +23,7 @@
 /*
 CREATE TABLE [analytics].[temp_production_run] (
     run_key                  VARCHAR(20)  NOT NULL PRIMARY KEY,
-    machine                  NVARCHAR(50) NOT NULL,
+    machine                  NVARCHAR(50),
     product_date             DATE,
     product_id               NVARCHAR(100),
     start_time               DATETIME,
@@ -168,7 +168,7 @@ BEGIN
                 cpb.[end time]                                                   AS end_time,
                 cpb.[End_time_CIP]                                               AS end_time_cip,
                 DATEDIFF(minute, cpb.[Splicing time 1],
-                    ISNULL(cpb.[End_time_CIP], ISNULL(cpb.[end time], GETUTCDATE()))) AS run_duration_minutes,
+                    ISNULL(cpb.[end time], GETUTCDATE())) AS run_duration_minutes,
                 i.counter_infeed                                                 AS in_feed_mc,
                 i.counter_outfeed                                                AS out_feed_mc,
                 ISNULL(cpb.[total_Var_Brik], 0)                                 AS scanned_briks,
