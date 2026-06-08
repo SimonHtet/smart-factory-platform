@@ -19,7 +19,8 @@ Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V5.3.sql` | Main event trigger on `T_M_Filler_Process` — splice tracking, downtime segments, CIP end time |
+| `TRI_UPDATE_FILLER_V5.4.sql` | Main event trigger on `T_M_Filler_Process` — splice tracking, downtime segments, CIP end time *(live)* |
+| `TRI_UPDATE_FILLER_V5.3.sql` | Previous version — superseded by V5.4 |
 | `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker (see note below) |
 | `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual |
 
@@ -94,7 +95,7 @@ PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.3
+## SQL Trigger — TRI_UPDATE_FILLER_V5.4 *(live)*
 
 Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table.
 
@@ -110,6 +111,13 @@ Sub-second event capture for splice signals (~10ms pulse — too fast for Python
 | Step 9 → 10 | `SEGMENT` | Log step-9 duration, reset timer |
 | Step 10 → 11 | `END` | Log step-10 warmup, close event |
 | Step 8/9/10 → 7 | `ABORT` | Roll back via `Current_Event_Seconds` |
+
+**Open batch detection (Step 13 guard — V5.4):**
+
+| Machine group | Open batch condition |
+|---|---|
+| A / D / M | `End_time_CIP IS NULL` — batch stays open until CIP completes; Step 13 re-stamps `end time` + counters on every fire |
+| F / G / H / K | `[end time] IS NULL` — write once |
 
 > "Breakdown" in company terms means >30 min — that classification is applied at the reporting layer, not in the trigger.
 
