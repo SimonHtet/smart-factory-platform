@@ -116,8 +116,20 @@ BEGIN
                 ORDER BY ID DESC
             ) cpb
             WHERE i.Machine_Step_No = 13
-              AND tpr.end_time IS NULL
-              AND tpr.start_time IS NOT NULL;
+              AND tpr.start_time IS NOT NULL
+              AND (
+                    (
+                        (i.Machine LIKE 'A%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
+                        AND tpr.end_time_cip IS NULL
+                    )
+                    OR
+                    (
+                        i.Machine NOT LIKE 'A%'
+                        AND i.Machine NOT LIKE 'D%'
+                        AND i.Machine NOT LIKE 'M%'
+                        AND tpr.end_time IS NULL
+                    )
+                  );
         END
 
         -- Step 14 + CIP : write end_time_cip — A/D/M only
