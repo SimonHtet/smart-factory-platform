@@ -83,7 +83,7 @@ BEGIN
            OR (i.Strip_Splicing_Signal_Strip         = 1 AND d.Strip_Splicing_Signal_Strip         = 0)
            OR (i.Machine_Step_No = 13)
            OR (i.Machine_Step_No = 14 AND i.Signal_Final_CIP = 1
-               AND (i.Machine LIKE 'A%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%'))
+               AND (i.Machine LIKE 'A%' OR i.Machine LIKE 'B%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%'))
     )
     RETURN;
 
@@ -119,12 +119,13 @@ BEGIN
               AND tpr.start_time IS NOT NULL
               AND (
                     (
-                        (i.Machine LIKE 'A%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
+                        (i.Machine LIKE 'A%' OR i.Machine LIKE 'B%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
                         AND tpr.end_time_cip IS NULL
                     )
                     OR
                     (
                         i.Machine NOT LIKE 'A%'
+                        AND i.Machine NOT LIKE 'B%'
                         AND i.Machine NOT LIKE 'D%'
                         AND i.Machine NOT LIKE 'M%'
                         AND tpr.end_time IS NULL
@@ -132,12 +133,12 @@ BEGIN
                   );
         END
 
-        -- Step 14 + CIP : write end_time_cip — A/D/M only
+        -- Step 14 + CIP : write end_time_cip — A/B/D/M only
         IF EXISTS (
             SELECT 1 FROM inserted
             WHERE Machine_Step_No = 14
               AND Signal_Final_CIP = 1
-              AND (Machine LIKE 'A%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
+              AND (Machine LIKE 'A%' OR Machine LIKE 'B%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
         )
         BEGIN
             UPDATE tpr
@@ -154,7 +155,7 @@ BEGIN
             ) cpb
             WHERE i.Machine_Step_No = 14
               AND i.Signal_Final_CIP = 1
-              AND (i.Machine LIKE 'A%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
+              AND (i.Machine LIKE 'A%' OR i.Machine LIKE 'B%' OR i.Machine LIKE 'D%' OR i.Machine LIKE 'M%')
               AND tpr.end_time_cip IS NULL
               AND tpr.end_time IS NOT NULL;
         END

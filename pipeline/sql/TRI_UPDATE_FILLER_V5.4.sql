@@ -155,6 +155,7 @@ BEGIN
         -- STEP 13 : End Splicing Loop
         -- V5.4: A/D/M re-stamp end_time while End_time_CIP IS NULL.
         --        F/G/H/K unchanged — write once ([end time] IS NULL).
+        -- V5.4 patch 2026-06-11: B machines added to CIP group (same as A/D/M).
         -- -------------------------------------------------------
         IF EXISTS (SELECT 1 FROM inserted WHERE Machine_Step_No = 13)
         BEGIN
@@ -167,15 +168,16 @@ BEGIN
             JOIN inserted i ON cpb.Machine = i.Machine
             WHERE cpb.[Splicing time 1] IS NOT NULL
               AND (
-                    -- A/D/M: re-log while CIP has not fired
+                    -- A/B/D/M: re-log while CIP has not fired
                     (
-                        (cpb.Machine LIKE 'A%' OR cpb.Machine LIKE 'D%' OR cpb.Machine LIKE 'M%')
+                        (cpb.Machine LIKE 'A%' OR cpb.Machine LIKE 'B%' OR cpb.Machine LIKE 'D%' OR cpb.Machine LIKE 'M%')
                         AND cpb.End_time_CIP IS NULL
                     )
                     OR
                     -- All others: write once only
                     (
                         cpb.Machine NOT LIKE 'A%'
+                        AND cpb.Machine NOT LIKE 'B%'
                         AND cpb.Machine NOT LIKE 'D%'
                         AND cpb.Machine NOT LIKE 'M%'
                         AND cpb.[end time] IS NULL
@@ -203,7 +205,7 @@ BEGIN
             SELECT 1 FROM inserted
             WHERE Machine_Step_No = 14
             AND Signal_Final_CIP = 1
-            AND (Machine LIKE 'A%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
+            AND (Machine LIKE 'A%' OR Machine LIKE 'B%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
         )
         BEGIN
             DECLARE @cur_Machine_S14   NVARCHAR(50)
@@ -217,7 +219,7 @@ BEGIN
                 FROM inserted
                 WHERE Machine_Step_No = 14
                 AND Signal_Final_CIP = 1
-                AND (Machine LIKE 'A%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
+                AND (Machine LIKE 'A%' OR Machine LIKE 'B%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
 
             OPEN step14_cursor
             FETCH NEXT FROM step14_cursor INTO @cur_Machine_S14
@@ -307,7 +309,7 @@ BEGIN
 
             WHILE @@FETCH_STATUS = 0
             BEGIN
-                IF @cur_Machine_ER LIKE 'A%' OR @cur_Machine_ER LIKE 'D%' OR @cur_Machine_ER LIKE 'M%'
+                IF @cur_Machine_ER LIKE 'A%' OR @cur_Machine_ER LIKE 'B%' OR @cur_Machine_ER LIKE 'D%' OR @cur_Machine_ER LIKE 'M%'
                 BEGIN
                     SELECT @GID = MAX(ID)
                     FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
