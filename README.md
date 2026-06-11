@@ -21,7 +21,7 @@ Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and
 |------|---------|
 | `TRI_UPDATE_FILLER_V5.4.sql` | Main event trigger on `T_M_Filler_Process` — splice tracking, downtime segments, CIP end time *(live)* |
 | `TRI_UPDATE_FILLER_V5.3.sql` | Previous version — superseded by V5.4 |
-| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08 to match V5.4 A/D/M re-log logic *(live)* |
+| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08; includes `TRI_UPDATE_SCANNED_BRIKS` (Step 4) for late scan support *(live)* |
 | `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual |
 
 ---
