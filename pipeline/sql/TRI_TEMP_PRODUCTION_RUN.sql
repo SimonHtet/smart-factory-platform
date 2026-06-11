@@ -372,3 +372,57 @@ SET
 FROM [analytics].[temp_production_run] tpr
 JOIN src ON tpr.run_key = src.run_key;
 */
+
+
+-- ============================================================
+-- STEP 4 : TRIGGER — Late scan update (scanned_briks)
+-- Fires on [Change paper brik] UPDATE when total_Var_Brik changes.
+-- Allows operators to scan briks after production end_time is set.
+-- Only scanned_briks, waste_op, efficiency_scanned update —
+-- all other columns (in_feed_mc, run_duration_minutes, etc.) untouched.
+-- ============================================================
+CREATE OR ALTER TRIGGER [dbo].[TRI_UPDATE_SCANNED_BRIKS]
+ON [dbo].[Change paper brik]
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM inserted i
+        JOIN deleted d ON i.ID = d.ID
+        WHERE ISNULL(i.[total_Var_Brik], 0) <> ISNULL(d.[total_Var_Brik], 0)
+    )
+    RETURN;
+
+    BEGIN TRANSACTION;
+    BEGIN TRY
+
+        UPDATE tpr
+        SET
+            tpr.scanned_briks      = ISNULL(i.[total_Var_Brik], 0),
+            tpr.waste_op           = CASE
+                                         WHEN tpr.in_feed_mc > 0
+                                         THEN ISNULL(i.[total_Var_Brik], 0) - tpr.in_feed_mc
+                                         ELSE tpr.waste_op
+                                     END,
+            tpr.efficiency_scanned = CASE
+                                         WHEN ISNULL(i.[total_Var_Brik], 0) > 0
+                                          AND tpr.run_duration_minutes > 0
+                                         THEN ISNULL(i.[total_Var_Brik], 0) / (tpr.run_duration_minutes * 400.0)
+                                         ELSE tpr.efficiency_scanned
+                                     END,
+            tpr.last_updated       = GETUTCDATE()
+        FROM [analytics].[temp_production_run] tpr
+        JOIN inserted i
+            ON tpr.run_key = CONVERT(varchar, CAST(i.[Product Date] AS DATE), 112) + i.Machine
+        WHERE ISNULL(i.[total_Var_Brik], 0) <> 0;
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        INSERT INTO t_log(txt) VALUES ('TRI_UPDATE_SCANNED_BRIKS:ERROR:' + ERROR_MESSAGE());
+    END CATCH
+END;
+GO
