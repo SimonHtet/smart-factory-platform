@@ -426,3 +426,40 @@ BEGIN
     END CATCH
 END;
 GO
+
+
+-- ============================================================
+-- STEP 5 : Backfill — sync all rows where scanned_briks is stale
+-- Run once after deploying TRI_UPDATE_SCANNED_BRIKS (Step 4).
+-- Catches any rows where total_Var_Brik changed before the
+-- trigger was live. Safe to re-run — only touches mismatched rows.
+-- ============================================================
+/*
+UPDATE tpr
+SET
+    tpr.scanned_briks      = ISNULL(cpb.[total_Var_Brik], 0),
+    tpr.waste_op           = CASE
+                                 WHEN tpr.in_feed_mc > 0
+                                 THEN ISNULL(cpb.[total_Var_Brik], 0) - tpr.in_feed_mc
+                                 ELSE tpr.waste_op
+                             END,
+    tpr.efficiency_scanned = CASE
+                                 WHEN ISNULL(cpb.[total_Var_Brik], 0) > 0
+                                  AND tpr.run_duration_minutes > 0
+                                 THEN ISNULL(cpb.[total_Var_Brik], 0) / (tpr.run_duration_minutes * 400.0)
+                                 ELSE tpr.efficiency_scanned
+                             END,
+    tpr.last_updated       = GETUTCDATE()
+FROM [analytics].[temp_production_run] tpr
+JOIN [dbo].[Change paper brik] cpb
+    ON cpb.Machine = tpr.machine
+   AND CAST(cpb.[Product Date] AS DATE) = tpr.product_date
+   AND cpb.ID = (
+       SELECT MAX(ID)
+       FROM [dbo].[Change paper brik]
+       WHERE Machine = tpr.machine
+         AND CAST([Product Date] AS DATE) = tpr.product_date
+   )
+WHERE tpr.scanned_briks <> ISNULL(cpb.[total_Var_Brik], 0)
+  AND ISNULL(cpb.[total_Var_Brik], 0) > 0;
+*/
