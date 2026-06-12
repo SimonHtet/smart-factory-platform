@@ -2,7 +2,7 @@
 
 End-to-end manufacturing data platform built for DairyPlus Co., Ltd. (Bangkok) — covering 23 Tetra Pak filler machines across 3 dairy production plants.
 
-Built in-house to replace a ฿1M+ vendor quote for custom MES trigger logic and reporting. Delivered in 6 months against an 18-month vendor timeline.
+Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was never needed. The production-operations core went live across all 3 plants within 6 months of an 18-month internal plan and runs daily in production; SAP raw-material integration is in progress (~50% of full scope delivered).
 
 ---
 
