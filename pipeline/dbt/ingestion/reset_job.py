@@ -6,7 +6,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 conn = pyodbc.connect(
     f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER=<internal-server>,1433;DATABASE=DB_BUDIBASE;"
+    f"SERVER={os.environ['DW_SERVER']},1433;DATABASE=DB_BUDIBASE;"
     f"UID={os.environ['DW_USER']};PWD={os.environ['DW_PASSWORD']};"
     f"Encrypt=yes;TrustServerCertificate=yes;"
 )

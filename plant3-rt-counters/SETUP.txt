@@ -33,10 +33,10 @@ STEP 3 — SET UP THE ENV FILE
 2. Open .env with Notepad
 3. Fill in the database details:
 
-    DB_SERVER=<internal-server>
+    DB_SERVER=<your-sql-server-host>
     DB_NAME=DB_BUDIBASE
-    DB_USER=budibase
-    DB_PASSWORD=<redacted>
+    DB_USER=<your-db-user>
+    DB_PASSWORD=<your-db-password>
 
 Save and close.
 

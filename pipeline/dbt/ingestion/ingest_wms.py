@@ -92,7 +92,7 @@ WATERMARK_TABLE = "analytics.ingestion_watermarks"
 def _wms_conn(db_name):
     return pyodbc.connect(
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER=<internal-server>,1433;"
+        f"SERVER={os.environ['WMS_SERVER']},1433;"
         f"DATABASE={db_name};"
         f"UID={os.environ['WMS_USER']};PWD={os.environ['WMS_PASSWORD']};"
         f"Encrypt=yes;TrustServerCertificate=yes;"
@@ -102,7 +102,7 @@ def _wms_conn(db_name):
 def _dw_conn():
     return pyodbc.connect(
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER=<internal-server>,1433;"
+        f"SERVER={os.environ['DW_SERVER']},1433;"
         f"DATABASE=DB_BUDIBASE;"
         f"UID={os.environ['DW_USER']};PWD={os.environ['DW_PASSWORD']};"
         f"Encrypt=yes;TrustServerCertificate=yes;"
