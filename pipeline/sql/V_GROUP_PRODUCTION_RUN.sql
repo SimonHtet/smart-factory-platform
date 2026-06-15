@@ -13,10 +13,49 @@
 -- Efficiency = SUM(out_feed_mc) / (SUM(run_duration_minutes) * 400)
 -- date_status = 'Today' for the latest product_date per group,
 --               YYYY-MM-DD string for all older dates (sorts correctly).
+--
+-- 2026-06-15 — BIG DOWNTIME segment correction (pairs with V5.5)
+-- -------------------------------------------------------
+-- On a big breakdown the OPMS feed counter resets to 0 mid-batch
+-- without a CIP (130000 -> 0 -> 150000). temp_production_run only
+-- carries the FINAL segment (150000); the pre-reset segments are
+-- captured in dbo.Feed_Segment_log by TRI_UPDATE_FILLER_V5.5.
+-- The `seg` CTE sums those lost segments per machine + product_date
+-- (1 batch ≈ 1 CIP-to-CIP loop ≈ 1 day, so this maps 1:1 to a tpr
+-- row) and adds them back into in_feed_mc / out_feed_mc / waste_tba.
+-- efficiency_outfeed recomputes off the corrected out_feed_mc.
+--
+-- ASSUMPTION (verify with VERIFY query at bottom): tpr.in_feed_mc
+-- holds the LAST segment (e.g. 150000) and Feed_Segment_log holds
+-- only the PRIOR breakdown segments (e.g. 130000) — so adding them
+-- is correct and never double-counts. If tpr ever froze on the
+-- FIRST segment instead, this would over-count; the VERIFY query
+-- catches that on day one.
 -- ============================================================
 
 CREATE OR ALTER VIEW [analytics].[v_group_production_run] AS
-WITH grouped AS (
+WITH seg AS (
+    -- feed lost to big-downtime resets, per machine per product_date
+    SELECT
+        cpb.Machine                       AS machine,
+        CAST(cpb.[Product Date] AS DATE)  AS product_date,
+        SUM(fs.In_Feed_Seg)               AS seg_in_feed,
+        SUM(fs.Out_Feed_Seg)              AS seg_out_feed
+    FROM [dbo].[Feed_Segment_log] fs
+    JOIN [dbo].[Change paper brik] cpb ON cpb.ID = fs.Batch_ID
+    GROUP BY cpb.Machine, CAST(cpb.[Product Date] AS DATE)
+),
+tpr AS (
+    SELECT
+        t.*,
+        ISNULL(s.seg_in_feed, 0)  AS seg_in_feed,
+        ISNULL(s.seg_out_feed, 0) AS seg_out_feed
+    FROM [analytics].[temp_production_run] t
+    LEFT JOIN seg s
+        ON s.machine = t.machine
+       AND s.product_date = t.product_date
+),
+grouped AS (
     -- A, D, M: grouped by machine prefix + product_date
     SELECT
         CASE
@@ -26,9 +65,9 @@ WITH grouped AS (
         END                                     AS machine_group,
         product_date,
         SUM(run_duration_minutes)               AS total_run_duration_minutes,
-        SUM(in_feed_mc)                         AS in_feed_mc,
-        SUM(out_feed_mc)                        AS out_feed_mc,
-        SUM(waste_tba)                          AS waste_tba,
+        SUM(in_feed_mc  + seg_in_feed)          AS in_feed_mc,
+        SUM(out_feed_mc + seg_out_feed)         AS out_feed_mc,
+        SUM(waste_tba + (seg_in_feed - seg_out_feed)) AS waste_tba,
         SUM(scanned_briks)                      AS scanned_briks,
         SUM(waste_op)                           AS waste_op,
         SUM(downtime_count)                     AS downtime_count,
@@ -36,7 +75,7 @@ WITH grouped AS (
         SUM(total_downtime_minutes)             AS total_downtime_minutes,
         SUM(downtime_lost_briks)                AS downtime_lost_briks,
         MAX(last_updated)                       AS last_updated
-    FROM [analytics].[temp_production_run]
+    FROM tpr
     WHERE machine LIKE 'A%' OR machine LIKE 'D%' OR machine LIKE 'M%'
     GROUP BY
         CASE
@@ -53,9 +92,9 @@ WITH grouped AS (
         machine                                 AS machine_group,
         product_date,
         run_duration_minutes                    AS total_run_duration_minutes,
-        in_feed_mc,
-        out_feed_mc,
-        waste_tba,
+        in_feed_mc  + seg_in_feed               AS in_feed_mc,
+        out_feed_mc + seg_out_feed              AS out_feed_mc,
+        waste_tba + (seg_in_feed - seg_out_feed) AS waste_tba,
         scanned_briks,
         waste_op,
         downtime_count,
@@ -63,7 +102,7 @@ WITH grouped AS (
         total_downtime_minutes,
         downtime_lost_briks,
         last_updated
-    FROM [analytics].[temp_production_run]
+    FROM tpr
     WHERE machine IN ('B1', 'B2')
 )
 SELECT
@@ -91,3 +130,40 @@ SELECT
     END                                                                  AS date_status
 FROM grouped;
 GO
+
+-- ============================================================
+-- VERIFY (run after first big downtime with a logged segment)
+-- Confirms tpr keeps the FINAL segment and the log keeps the PRIOR
+-- ones — i.e. seg + tpr = true total, no double count.
+-- ============================================================
+/*
+SELECT
+    fs.Machine,
+    CAST(cpb.[Product Date] AS DATE)        AS product_date,
+    SUM(fs.In_Feed_Seg)                     AS prior_segments_infeed,   -- e.g. 130000
+    MAX(tpr.in_feed_mc)                      AS tpr_final_infeed,        -- expect 150000, NOT 130000
+    SUM(fs.In_Feed_Seg) + MAX(tpr.in_feed_mc) AS true_total_infeed       -- expect 280000
+FROM [dbo].[Feed_Segment_log] fs
+JOIN [dbo].[Change paper brik] cpb ON cpb.ID = fs.Batch_ID
+JOIN [analytics].[temp_production_run] tpr
+     ON tpr.machine = fs.Machine
+    AND tpr.product_date = CAST(cpb.[Product Date] AS DATE)
+GROUP BY fs.Machine, CAST(cpb.[Product Date] AS DATE)
+ORDER BY product_date DESC;
+*/
+
+-- ============================================================
+-- SAFETY NET — stale open CIP detector (orphan batch alarm)
+-- If an FCIP sensor misses, End_time_CIP stays NULL forever and the
+-- next batch's reset would accumulate onto the dead one. Surface it
+-- instead of letting totals balloon silently. Tune the -8h window.
+-- ============================================================
+/*
+SELECT Machine, ID AS Batch_ID, [end time],
+       DATEDIFF(HOUR, [end time], GETUTCDATE()) AS hrs_open
+FROM [dbo].[Change paper brik]
+WHERE End_time_CIP IS NULL
+  AND (Machine LIKE 'A%' OR Machine LIKE 'B%' OR Machine LIKE 'D%' OR Machine LIKE 'M%')
+  AND [end time] < DATEADD(HOUR, -8, GETUTCDATE())
+ORDER BY hrs_open DESC;
+*/
