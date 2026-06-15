@@ -31,6 +31,16 @@
 -- is correct and never double-counts. If tpr ever froze on the
 -- FIRST segment instead, this would over-count; the VERIFY query
 -- catches that on day one.
+--
+-- 2026-06-15 — BIG DOWNTIME loss exposure (pairs with V5.6)
+-- -------------------------------------------------------
+-- The `bdl` CTE sums big-downtime DURATION (CLOSED rows only) from
+-- dbo.Big_Downtime_log per machine + product_date and exposes it as
+-- big_downtime_seconds / _minutes / _lost_briks (= minutes * 400),
+-- kept SEPARATE from the mini-stoppage downtime_* columns so the two
+-- stay splittable (matches the >30-min breakdown classification).
+-- OPEN rows are excluded (not finished); VOID rows are excluded (FCIP
+-- = intentional end, not a loss).
 -- ============================================================
 
 CREATE OR ALTER VIEW [analytics].[v_group_production_run] AS
@@ -45,15 +55,30 @@ WITH seg AS (
     JOIN [dbo].[Change paper brik] cpb ON cpb.ID = fs.Batch_ID
     GROUP BY cpb.Machine, CAST(cpb.[Product Date] AS DATE)
 ),
+bdl AS (
+    -- big-downtime time loss (CLOSED rows only) per machine per product_date
+    SELECT
+        cpb.Machine                       AS machine,
+        CAST(cpb.[Product Date] AS DATE)  AS product_date,
+        SUM(bd.Duration_Seconds)          AS big_dt_seconds
+    FROM [dbo].[Big_Downtime_log] bd
+    JOIN [dbo].[Change paper brik] cpb ON cpb.ID = bd.Batch_ID
+    WHERE bd.Status = 'CLOSED'
+    GROUP BY cpb.Machine, CAST(cpb.[Product Date] AS DATE)
+),
 tpr AS (
     SELECT
         t.*,
-        ISNULL(s.seg_in_feed, 0)  AS seg_in_feed,
-        ISNULL(s.seg_out_feed, 0) AS seg_out_feed
+        ISNULL(s.seg_in_feed, 0)    AS seg_in_feed,
+        ISNULL(s.seg_out_feed, 0)   AS seg_out_feed,
+        ISNULL(b.big_dt_seconds, 0) AS big_dt_seconds
     FROM [analytics].[temp_production_run] t
     LEFT JOIN seg s
         ON s.machine = t.machine
        AND s.product_date = t.product_date
+    LEFT JOIN bdl b
+        ON b.machine = t.machine
+       AND b.product_date = t.product_date
 ),
 grouped AS (
     -- A, D, M: grouped by machine prefix + product_date
@@ -74,6 +99,9 @@ grouped AS (
         SUM(total_downtime_seconds)             AS total_downtime_seconds,
         SUM(total_downtime_minutes)             AS total_downtime_minutes,
         SUM(downtime_lost_briks)                AS downtime_lost_briks,
+        SUM(big_dt_seconds)                     AS big_downtime_seconds,
+        SUM(big_dt_seconds) / 60.0              AS big_downtime_minutes,
+        (SUM(big_dt_seconds) / 60.0) * 400      AS big_downtime_lost_briks,
         MAX(last_updated)                       AS last_updated
     FROM tpr
     WHERE machine LIKE 'A%' OR machine LIKE 'D%' OR machine LIKE 'M%'
@@ -101,6 +129,9 @@ grouped AS (
         total_downtime_seconds,
         total_downtime_minutes,
         downtime_lost_briks,
+        big_dt_seconds                          AS big_downtime_seconds,
+        big_dt_seconds / 60.0                   AS big_downtime_minutes,
+        (big_dt_seconds / 60.0) * 400           AS big_downtime_lost_briks,
         last_updated
     FROM tpr
     WHERE machine IN ('B1', 'B2')
@@ -119,9 +150,13 @@ SELECT
     total_downtime_seconds,
     total_downtime_minutes,
     downtime_lost_briks,
+    big_downtime_seconds,
+    big_downtime_minutes,
+    big_downtime_lost_briks,
     out_feed_mc   / NULLIF(total_run_duration_minutes * 400.0, 0)       AS efficiency_outfeed,
     scanned_briks / NULLIF(total_run_duration_minutes * 400.0, 0)       AS efficiency_scanned,
-    downtime_lost_briks / NULLIF(out_feed_mc, 0)                        AS efficiency_lost_downtime,
+    downtime_lost_briks     / NULLIF(out_feed_mc, 0)                    AS efficiency_lost_downtime,
+    big_downtime_lost_briks / NULLIF(out_feed_mc, 0)                    AS efficiency_lost_big_downtime,
     last_updated,
     CASE
         WHEN product_date = MAX(product_date) OVER (PARTITION BY machine_group)
