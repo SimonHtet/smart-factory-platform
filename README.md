@@ -19,10 +19,14 @@ Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was neve
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V5.4.sql` | Main event trigger on `T_M_Filler_Process` — splice tracking, downtime segments, CIP end time *(live)* |
-| `TRI_UPDATE_FILLER_V5.3.sql` | Previous version — superseded by V5.4 |
+| `TRI_UPDATE_FILLER_V5.6.sql` | Main event trigger on `T_M_Filler_Process` — V5.5 + big-downtime *duration* tracking (`Big_Downtime_log`): a breakdown goes `11→8→7→12→13→14` (no CIP) and aborts out of the mini-stoppage logic, so its time loss is captured separately. *(latest)* |
+| `TRI_UPDATE_FILLER_V5.5.sql` | V5.4 + big-downtime *throughput* correction (`Feed_Segment_log`): the feed counter resets to 0 mid-batch without a CIP (`130000→0→150000`); pre-reset values are logged and re-summed so totals are correct. |
+| `TRI_UPDATE_FILLER_V5.4.sql` | Splice tracking, mini-downtime segments, CIP end time — superseded by V5.5/V5.6 |
+| `TRI_UPDATE_FILLER_V5.3.sql` | Previous version — superseded |
 | `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08; includes `TRI_UPDATE_SCANNED_BRIKS` (Step 4) for late scan support *(live)* |
-| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual |
+| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual; adds back big-downtime feed loss (V5.5) and exposes big-downtime time loss (V5.6), separate from mini-stoppage downtime |
+
+**Big-downtime model (A/B/D/M, the CIP groups):** a real breakdown resets the OPMS feed counter to 0 and does an intermediate CIP (ICIP) with **no `Signal_Final_CIP`**, vs a normal finish which raises it (FCIP). `End_time_CIP IS NULL` is the single discriminator throughout — no CIP ⇒ same batch continuing (accumulate throughput + count the time loss); CIP ⇒ legitimate run end (ignore).
 
 ---
 
@@ -95,7 +99,7 @@ PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.4 *(live)*
+## SQL Trigger — TRI_UPDATE_FILLER_V5.6 *(latest)*
 
 Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table.
 
@@ -105,12 +109,16 @@ Sub-second event capture for splice signals (~10ms pulse — too fast for Python
 |---|---|---|
 | Step 10 | splice signal 0→1 | Write `Splicing time 1` |
 | Step 13 | — | Write `end time`, `In_Feed_MC`, `Out_Feed_MC` |
-| Step 14 + CIP=1 | A/D/M only | Write `End_time_CIP` (1-hour cooldown) |
+| Step 14 + CIP=1 | A/B/D/M | Write `End_time_CIP` (1-hour cooldown) |
 | Step 11 → 8 | `START` | Increment `Downtime_Count`, stamp timer |
 | Step 8 → 9 | `SEGMENT` | Log step-8 duration, reset timer |
 | Step 9 → 10 | `SEGMENT` | Log step-9 duration, reset timer |
 | Step 10 → 11 | `END` | Log step-10 warmup, close event |
-| Step 8/9/10 → 7 | `ABORT` | Roll back via `Current_Event_Seconds` |
+| Step 8/9/10 → 7 | `ABORT` | Roll back mini-stoppage; stash stop time for big-downtime |
+| counter → 0 | `_BD:RESET` (V5.5) | Log pre-reset feed to `Feed_Segment_log` (big-downtime throughput) |
+| Step 7 → 12 | `_BDL:OPEN` (V5.6) | Open `Big_Downtime_log` row (big-downtime time loss starts) |
+| Step 14 + CIP=1 | `_BDL:VOID` (V5.6) | FCIP ⇒ intentional end ⇒ void the open big-downtime row |
+| → Step 11 | `_BDL:CLOSE` (V5.6) | Resume with no CIP ⇒ close row, stamp duration (the loss) |
 
 **Open batch detection (Step 13 guard — V5.4):**
 
