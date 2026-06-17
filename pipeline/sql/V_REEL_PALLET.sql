@@ -27,9 +27,10 @@
 --   start_pallet = FLOOR(start_count / pallet_size) + 1
 --   end_pallet   = CEILING(end_count  / pallet_size)
 --
--- SCOPE (v1): Group M only (Machine LIKE 'M%'), [Product Date] >= today,
+-- SCOPE (v1): Group M only (Machine LIKE 'M%'), [Product Date] >= 2026-06-16
+--             (M1's running batch carries yesterday's product date),
 --             currently running batch (End_time_CIP IS NULL).
---             Widen by editing the WHERE clauses in both reel CTEs.
+--             Widen / change the date by editing the WHERE in both reel CTEs.
 -- ASSUMPTIONS (v1):
 --   * pallet_size hardcoded 4800. Parametrize via Product_Pallet_Spec later.
 --   * RAW live counter (no V5.5 SUM(Feed_Segment_log) correction). Fine for a
@@ -104,7 +105,7 @@ reel AS (
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
     WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
-      AND cpb.[Product Date] >= CAST(GETDATE() AS DATE)    -- today onward only
+      AND cpb.[Product Date] >= '2026-06-16'               -- from 2026-06-16 (M1 run started yesterday)
       AND cpb.End_time_CIP IS NULL                          -- currently running batch
       AND v.ord IS NOT NULL                                 -- only reels actually loaded
 )
@@ -171,7 +172,7 @@ reel AS (
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
     WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
-      AND cpb.[Product Date] >= CAST(GETDATE() AS DATE)    -- today onward only
+      AND cpb.[Product Date] >= '2026-06-16'               -- from 2026-06-16 (M1 run started yesterday)
       AND cpb.End_time_CIP IS NULL                          -- currently running batch
       AND v.ord IS NOT NULL
 ),
