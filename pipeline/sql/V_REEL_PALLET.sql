@@ -15,30 +15,42 @@
 --   [OrderN], [ReelN]          -> supplier_barcode = Order + Reel
 --   [Var count N]              -> briks the SUPPLIER declares on that reel
 -- Cumulative-summing the per-reel counts in reel order gives exact reel
--- boundaries -- no R, no even-split guess, no Reel_Splice_log, no live
--- counter. Works retroactively on a batch already running.
+-- boundaries -- no estimate, no live counter, no Reel_Splice_log. Works
+-- retroactively on a batch already running.
 --   reel seq N : end_count   = SUM(var_count for reels 1..N)
 --                start_count = end_count - var_count(N)
---                pallets     = FLOOR(start/4800)+1 .. CEILING(end/4800)
+--
+-- PER-ORDER PALLET RESET (added 2026-06-17)
+-- -------------------------------------------------------
+-- Pallet numbers restart at 1 on every customer ORDER change; a REEL change
+-- within the same order keeps counting. Implemented by subtracting the
+-- order's start_count (briks before the order's first reel):
+--   order_start = MIN(start_count) within the order run
+--   pallet      = FLOOR((start_count - order_start)/4800)+1
+--                 .. CEILING((end_count - order_start)/4800)
+-- => pallet_no is NO LONGER unique per batch (pallet 3 exists in every order),
+--    so v_reel_pallet_map now also exposes [order_no]. Recall lookups must
+--    filter BOTH order_no and pallet_no.
+-- order_run = running count of order changes (handles a repeated order value
+--    appearing in two separate runs correctly).
 --
 -- DEDUP: the PLC repeats the same (Order,Reel) across several consecutive
--- columns while one reel runs (and repeats its [Var count] with it), so we
--- LAG-dedup consecutive identical (Order,Reel) pairs -- keeping the first
--- column of each run, which carries that reel's count -- then ROW_NUMBER the
--- survivors into seq = true reel order. supplier_barcode via decimal(38,0)
--- cast to kill float scientific notation.
+-- columns while one reel runs (and repeats [Var count] with it) -> LAG-dedup
+-- consecutive identical (Order,Reel) pairs, keep the first column of each run,
+-- ROW_NUMBER survivors into seq = true reel order. supplier_barcode via
+-- decimal(38,0) cast to kill float scientific notation.
 --
 -- PALLET MATH (FLOOR/CEILING so a reel straddling a pallet boundary flags
 -- that pallet for BOTH reels -> recall-safe).
 --
 -- SCOPE (v1): Group M only (Machine LIKE 'M%'), [Product Date] >= 2026-06-16,
 --             currently running batch (End_time_CIP IS NULL).
--- ASSUMPTIONS: pallet_size = 4800 (hardcoded; Product_Pallet_Spec later);
---             [Var count N] is constant across a reel's duplicate columns;
---             columns are [Order1..45]/[Reel1..45]/[Var count 1..45].
--- NOTE: the running (last) reel uses its FULL declared count even though it
---       isn't fully consumed yet -> slightly over-includes its tail pallets,
---       which is the safe direction for recall.
+-- ASSUMPTIONS: pallet_size = 4800 (hardcoded; Product_Pallet_Spec later -- a
+--             different order may have a different pallet size); [Var count N]
+--             constant across a reel's duplicate columns; orders run
+--             contiguously; columns [Order1..45]/[Reel1..45]/[Var count 1..45].
+-- NOTE: the running (last) reel uses its FULL declared count -> safely
+--       over-includes its tail pallets (the safe direction for recall).
 -- ============================================================
 
 USE [DB_BUDIBASE]
@@ -48,7 +60,8 @@ GO
 -- VIEW A : v_reel_pallet_estimate
 -- One row per reel in each running M batch.
 -- Columns: id, product_id, supplier_barcode, outfeed
--- (outfeed = cumulative declared briks through the end of that reel.)
+-- (outfeed = cumulative declared briks through the end of that reel --
+--  a physical running total, does NOT reset per order.)
 -- ------------------------------------------------------------
 CREATE OR ALTER VIEW [analytics].[v_reel_pallet_estimate] AS
 WITH reel_raw AS (
@@ -113,10 +126,11 @@ GO
 -- ------------------------------------------------------------
 -- VIEW B : v_reel_pallet_map
 -- One row per (reel, pallet) -> the many-to-many recall surface.
--- Columns: id, product_id, supplier_barcode, pallet_no
--- A bad pallet:  SELECT supplier_barcode FROM analytics.v_reel_pallet_map
---                WHERE id = @batch AND pallet_no = @pallet;
--- A bad reel:    ... WHERE supplier_barcode = @bc;  -> every pallet it touched.
+-- Columns: id, product_id, order_no, supplier_barcode, pallet_no
+-- Pallet numbers RESET to 1 per order_no, so recall lookups need both:
+--   bad pallet: SELECT supplier_barcode FROM analytics.v_reel_pallet_map
+--               WHERE id=@batch AND order_no=@order AND pallet_no=@pallet;
+--   bad reel:   ... WHERE supplier_barcode=@bc;  -> every pallet it touched.
 -- ------------------------------------------------------------
 CREATE OR ALTER VIEW [analytics].[v_reel_pallet_map] AS
 WITH reel_raw AS (
@@ -160,9 +174,10 @@ reel_dd AS (
     FROM reel_raw
 ),
 reel AS (
-    SELECT Batch_ID, product_id, Machine,
+    SELECT Batch_ID, product_id, Machine, ord,
            ROW_NUMBER() OVER (PARTITION BY Batch_ID ORDER BY N) AS seq,
            ISNULL(varc, 0) AS varc,
+           CAST(CAST(ord AS decimal(38,0)) AS varchar(50)) AS order_no,
            CAST(CAST(ord  AS decimal(38,0)) AS varchar(50))
          + CAST(CAST(reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
     FROM reel_dd
@@ -170,19 +185,29 @@ reel AS (
        OR ord <> prev_ord OR reel <> prev_reel
 ),
 cum AS (
-    SELECT Batch_ID, product_id, supplier_barcode, varc,
+    SELECT Batch_ID, product_id, order_no, supplier_barcode, ord, varc, seq,
            SUM(varc) OVER (PARTITION BY Batch_ID ORDER BY seq
                            ROWS UNBOUNDED PRECEDING) AS end_count
     FROM reel
 ),
+ordtag AS (
+    SELECT *, LAG(ord) OVER (PARTITION BY Batch_ID ORDER BY seq) AS prev_ord_seq
+    FROM cum
+),
+ordrun AS (
+    SELECT *,
+           SUM(CASE WHEN prev_ord_seq IS NULL OR ord <> prev_ord_seq THEN 1 ELSE 0 END)
+               OVER (PARTITION BY Batch_ID ORDER BY seq ROWS UNBOUNDED PRECEDING) AS order_run
+    FROM ordtag
+),
 rng AS (
     SELECT
-        Batch_ID AS id, product_id, supplier_barcode,
-        CONVERT(INT, FLOOR((end_count - varc) / 4800.0) + 1) AS start_pallet,
-        CONVERT(INT, CEILING(end_count        / 4800.0))     AS end_pallet
-    FROM cum
+        Batch_ID AS id, product_id, order_no, supplier_barcode,
+        CONVERT(INT, FLOOR(((end_count - varc) - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, order_run)) / 4800.0) + 1) AS start_pallet,
+        CONVERT(INT, CEILING((end_count        - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, order_run)) / 4800.0))     AS end_pallet
+    FROM ordrun
 )
-SELECT rng.id, rng.product_id, rng.supplier_barcode, p.pallet_no
+SELECT rng.id, rng.product_id, rng.order_no, rng.supplier_barcode, p.pallet_no
 FROM rng
 CROSS APPLY (
     SELECT TOP (rng.end_pallet - rng.start_pallet + 1)
