@@ -27,7 +27,9 @@
 --   start_pallet = FLOOR(start_count / pallet_size) + 1
 --   end_pallet   = CEILING(end_count  / pallet_size)
 --
--- SCOPE: current running batches only (End_time_CIP IS NULL).
+-- SCOPE (v1): Group M only (Machine LIKE 'M%'), [Product Date] >= today,
+--             currently running batch (End_time_CIP IS NULL).
+--             Widen by editing the WHERE clauses in both reel CTEs.
 -- ASSUMPTIONS (v1):
 --   * pallet_size hardcoded 4800. Parametrize via Product_Pallet_Spec later.
 --   * RAW live counter (no V5.5 SUM(Feed_Segment_log) correction). Fine for a
@@ -101,8 +103,10 @@ reel AS (
         (43, cpb.[Order43], cpb.[Reel43]),(44, cpb.[Order44], cpb.[Reel44]),
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
-    WHERE cpb.End_time_CIP IS NULL          -- current running batches only
-      AND v.ord IS NOT NULL                  -- only reels actually loaded
+    WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
+      AND cpb.[Product Date] >= CAST(GETDATE() AS DATE)    -- today onward only
+      AND cpb.End_time_CIP IS NULL                          -- currently running batch
+      AND v.ord IS NOT NULL                                 -- only reels actually loaded
 )
 SELECT
     r.Batch_ID         AS id,
@@ -166,7 +170,9 @@ reel AS (
         (43, cpb.[Order43], cpb.[Reel43]),(44, cpb.[Order44], cpb.[Reel44]),
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
-    WHERE cpb.End_time_CIP IS NULL
+    WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
+      AND cpb.[Product Date] >= CAST(GETDATE() AS DATE)    -- today onward only
+      AND cpb.End_time_CIP IS NULL                          -- currently running batch
       AND v.ord IS NOT NULL
 ),
 rng AS (
