@@ -12,13 +12,17 @@
 --
 -- MODEL
 -- -------------------------------------------------------
--- [Change paper brik] stores, per batch, up to 45 reels loaded in order:
---   [Order1]/[Reel1] = 1st reel loaded, ... [OrderN]/[ReelN] = Nth reel.
---   supplier_barcode = Order + Reel concatenated.
+-- [Change paper brik] stores, per batch, up to 45 reel slots:
+--   [Order1]/[Reel1] ... [OrderN]/[ReelN], supplier_barcode = Order + Reel.
+--   ** The PLC repeats the same (Order,Reel) across several consecutive
+--      columns while one reel is running, so the raw column index is NOT
+--      the reel sequence. We DEDUPE consecutive identical (Order,Reel)
+--      pairs (a new barcode only when the reel/order actually changes),
+--      then RE-RANK the survivors with ROW_NUMBER -> seq = true reel order. **
 -- [Reel_Splice_log] stores the live outfeed counter at each End-Roll.
 --   Splice_No (k) = kth end-roll = boundary that ENDS reel k, STARTS reel k+1.
--- So reel N occupies outfeed [ boundary(k=N-1) .. boundary(k=N) ):
---   reel 1  : 0                 -> counter at splice 1
+-- So reel seq N occupies outfeed [ boundary(k=N-1) .. boundary(k=N) ):
+--   reel 1  : 0                  -> counter at splice 1
 --   reel N  : counter@splice N-1 -> counter@splice N
 --   running : counter@last splice -> live T_M_Filler_Process.counter_outfeed
 --
@@ -27,16 +31,17 @@
 --   start_pallet = FLOOR(start_count / pallet_size) + 1
 --   end_pallet   = CEILING(end_count  / pallet_size)
 --
--- SCOPE (v1): Group M only (Machine LIKE 'M%'), [Product Date] >= 2026-06-16
---             (M1's running batch carries yesterday's product date),
---             currently running batch (End_time_CIP IS NULL).
+-- SCOPE (v1): Group M only (Machine LIKE 'M%' -> M1/M2/M3, one running batch
+--             each), [Product Date] >= 2026-06-16 (M runs carry yesterday's
+--             product date), currently running batch (End_time_CIP IS NULL).
 --             Widen / change the date by editing the WHERE in both reel CTEs.
 -- ASSUMPTIONS (v1):
 --   * pallet_size hardcoded 4800. Parametrize via Product_Pallet_Spec later.
 --   * RAW live counter (no V5.5 SUM(Feed_Segment_log) correction). Fine for a
 --     clean run; a mid-run big-downtime counter reset would distort it -> v2.
+--   * Dedup is CONSECUTIVE only (matches a PLC that holds a value until the
+--     reel changes). Non-consecutive repeats would need DISTINCT logic.
 --   * Order/Reel columns are [Order1..45]/[Reel1..45] (no space, no _No).
---     If the real names differ, fix the CROSS APPLY (VALUES ...) lists below.
 --
 -- Run ONCE before these views (also in the V5.7 header):
 --   CREATE TABLE [dbo].[Reel_Splice_log] (
@@ -55,10 +60,8 @@ GO
 
 -- ------------------------------------------------------------
 -- VIEW A : v_reel_pallet_estimate
--- One row per reel in each running batch.
+-- One row per (deduped) reel in each running M batch.
 -- Columns: id, product_id, supplier_barcode, outfeed
--- (outfeed = cumulative outfeed at which that reel ended; live for the
---  currently running reel.)
 -- ------------------------------------------------------------
 CREATE OR ALTER VIEW [analytics].[v_reel_pallet_estimate] AS
 WITH splice AS (
@@ -70,14 +73,9 @@ live AS (
     FROM [dbo].[T_M_Filler_Process]
     GROUP BY Machine
 ),
-reel AS (
-    SELECT
-        cpb.ID           AS Batch_ID,
-        cpb.[Product_ID] AS product_id,
-        cpb.Machine,
-        v.N,
-        CAST(CAST(v.ord  AS decimal(38,0)) AS varchar(50))
-      + CAST(CAST(v.reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
+reel_raw AS (
+    SELECT cpb.ID AS Batch_ID, cpb.[Product_ID] AS product_id, cpb.Machine,
+           v.N, v.ord, v.reel
     FROM [dbo].[Change paper brik] cpb
     CROSS APPLY (VALUES
         (1, cpb.[Order1], cpb.[Reel1]),   (2, cpb.[Order2], cpb.[Reel2]),
@@ -105,17 +103,32 @@ reel AS (
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
     WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
-      AND cpb.[Product Date] >= '2026-06-16'               -- from 2026-06-16 (M1 run started yesterday)
+      AND cpb.[Product Date] >= '2026-06-16'               -- from 2026-06-16
       AND cpb.End_time_CIP IS NULL                          -- currently running batch
-      AND v.ord IS NOT NULL                                 -- only reels actually loaded
+      AND v.ord IS NOT NULL                                 -- only filled reel slots
+),
+reel_dd AS (
+    SELECT Batch_ID, product_id, Machine, N, ord, reel,
+           LAG(ord)  OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_ord,
+           LAG(reel) OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_reel
+    FROM reel_raw
+),
+reel AS (
+    SELECT Batch_ID, product_id, Machine,
+           ROW_NUMBER() OVER (PARTITION BY Batch_ID ORDER BY N) AS seq,  -- true reel order
+           CAST(CAST(ord  AS decimal(38,0)) AS varchar(50))
+         + CAST(CAST(reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
+    FROM reel_dd
+    WHERE prev_ord IS NULL                       -- first reel
+       OR ord <> prev_ord OR reel <> prev_reel   -- reel/order actually changed
 )
 SELECT
     r.Batch_ID         AS id,
     r.product_id,
     r.supplier_barcode,
-    ISNULL(s_end.c, l.live_c) AS outfeed     -- boundary k=N, else live (running reel)
+    ISNULL(s_end.c, l.live_c) AS outfeed         -- boundary k=seq, else live (running reel)
 FROM reel r
-LEFT JOIN splice s_end ON s_end.Batch_ID = r.Batch_ID AND s_end.k = r.N
+LEFT JOIN splice s_end ON s_end.Batch_ID = r.Batch_ID AND s_end.k = r.seq
 LEFT JOIN live   l     ON l.Machine = r.Machine
 GO
 
@@ -137,14 +150,9 @@ live AS (
     FROM [dbo].[T_M_Filler_Process]
     GROUP BY Machine
 ),
-reel AS (
-    SELECT
-        cpb.ID           AS Batch_ID,
-        cpb.[Product_ID] AS product_id,
-        cpb.Machine,
-        v.N,
-        CAST(CAST(v.ord  AS decimal(38,0)) AS varchar(50))
-      + CAST(CAST(v.reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
+reel_raw AS (
+    SELECT cpb.ID AS Batch_ID, cpb.[Product_ID] AS product_id, cpb.Machine,
+           v.N, v.ord, v.reel
     FROM [dbo].[Change paper brik] cpb
     CROSS APPLY (VALUES
         (1, cpb.[Order1], cpb.[Reel1]),   (2, cpb.[Order2], cpb.[Reel2]),
@@ -171,10 +179,25 @@ reel AS (
         (43, cpb.[Order43], cpb.[Reel43]),(44, cpb.[Order44], cpb.[Reel44]),
         (45, cpb.[Order45], cpb.[Reel45])
     ) v(N, ord, reel)
-    WHERE cpb.Machine LIKE 'M%'                            -- Group M only (v1 scope)
-      AND cpb.[Product Date] >= '2026-06-16'               -- from 2026-06-16 (M1 run started yesterday)
-      AND cpb.End_time_CIP IS NULL                          -- currently running batch
+    WHERE cpb.Machine LIKE 'M%'
+      AND cpb.[Product Date] >= '2026-06-16'
+      AND cpb.End_time_CIP IS NULL
       AND v.ord IS NOT NULL
+),
+reel_dd AS (
+    SELECT Batch_ID, product_id, Machine, N, ord, reel,
+           LAG(ord)  OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_ord,
+           LAG(reel) OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_reel
+    FROM reel_raw
+),
+reel AS (
+    SELECT Batch_ID, product_id, Machine,
+           ROW_NUMBER() OVER (PARTITION BY Batch_ID ORDER BY N) AS seq,
+           CAST(CAST(ord  AS decimal(38,0)) AS varchar(50))
+         + CAST(CAST(reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
+    FROM reel_dd
+    WHERE prev_ord IS NULL
+       OR ord <> prev_ord OR reel <> prev_reel
 ),
 rng AS (
     SELECT
@@ -182,8 +205,8 @@ rng AS (
         CONVERT(INT, FLOOR(ISNULL(s_start.c, 0)        / 4800.0) + 1) AS start_pallet,
         CONVERT(INT, CEILING(ISNULL(s_end.c, l.live_c) / 4800.0))     AS end_pallet
     FROM reel r
-    LEFT JOIN splice s_start ON s_start.Batch_ID = r.Batch_ID AND s_start.k = r.N - 1
-    LEFT JOIN splice s_end   ON s_end.Batch_ID   = r.Batch_ID AND s_end.k   = r.N
+    LEFT JOIN splice s_start ON s_start.Batch_ID = r.Batch_ID AND s_start.k = r.seq - 1
+    LEFT JOIN splice s_end   ON s_end.Batch_ID   = r.Batch_ID AND s_end.k   = r.seq
     LEFT JOIN live   l       ON l.Machine = r.Machine
 )
 SELECT rng.id, rng.product_id, rng.supplier_barcode, p.pallet_no
