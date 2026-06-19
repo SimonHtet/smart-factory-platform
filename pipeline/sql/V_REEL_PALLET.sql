@@ -162,9 +162,11 @@ WITH reel_raw AS (
         (43, cpb.[Order43], cpb.[Reel43], cpb.[Var count 43]),(44, cpb.[Order44], cpb.[Reel44], cpb.[Var count 44]),
         (45, cpb.[Order45], cpb.[Reel45], cpb.[Var count 45])
     ) v(N, ord, reel, varc)
-    WHERE cpb.Machine LIKE 'M%'
-      AND cpb.[Product Date] >= '2026-06-16'
-      AND cpb.End_time_CIP IS NULL
+    WHERE cpb.Machine LIKE 'M%'          -- Group M only (v1 functional scope, kept)
+      -- DE-SCOPED 2026-06-19: removed the two "currently-running-batch" guards
+      -- so finished batches no longer disappear -> view now covers ALL HISTORY.
+      --   AND cpb.[Product Date] >= '2026-06-16'   (removed)
+      --   AND cpb.End_time_CIP IS NULL             (removed)
       AND v.ord IS NOT NULL
 ),
 reel_dd AS (
