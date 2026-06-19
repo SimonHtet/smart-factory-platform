@@ -20,24 +20,27 @@
 --   reel seq N : end_count   = SUM(var_count for reels 1..N)
 --                start_count = end_count - var_count(N)
 --
--- PER-ORDER PALLET RESET (added 2026-06-17)
+-- PER-SUPPLIER PALLET RESET (order-based 2026-06-17, switched to supplier 2026-06-19)
 -- -------------------------------------------------------
--- Pallet numbers restart at 1 on every customer ORDER change; a REEL change
--- within the same order keeps counting. Implemented by subtracting the
--- order's start_count (briks before the order's first reel):
---   order_start = MIN(start_count) within the order run
---   pallet      = FLOOR((start_count - order_start)/4800)+1
---                 .. CEILING((end_count - order_start)/4800)
--- => pallet_no is NO LONGER unique per batch (pallet 3 exists in every order),
---    so v_reel_pallet_map now also exposes [order_no]. Recall lookups must
---    filter BOTH order_no and pallet_no.
--- order_run = running count of order changes (handles a repeated order value
---    appearing in two separate runs correctly).
+-- Pallet numbers restart at 1 on every SUPPLIER change (supplier1->supplier2);
+-- a REEL change within the same supplier keeps counting. Supplier is a more
+-- reliable boundary signal than the order field. Implemented by subtracting the
+-- supplier run's start_count (briks before that supplier's first reel):
+--   sup_start = MIN(start_count) within the supplier run
+--   pallet    = FLOOR((start_count - sup_start)/4800)+1
+--               .. CEILING((end_count - sup_start)/4800)
+-- => pallet_no is NOT unique per batch (pallet 3 exists in every supplier run),
+--    so v_reel_pallet_map exposes [supplier_no] (and [order_no] for reference).
+--    Recall lookups must filter BOTH supplier_no and pallet_no.
+-- supplier_run = running count of supplier changes (handles a repeated supplier
+--    value appearing in two separate runs correctly).
 --
--- DEDUP: the PLC repeats the same (Order,Reel) across several consecutive
--- columns while one reel runs (and repeats [Var count] with it) -> LAG-dedup
--- consecutive identical (Order,Reel) pairs, keep the first column of each run,
--- ROW_NUMBER survivors into seq = true reel order. supplier_barcode via
+-- DEDUP: the PLC repeats the same (Supplier,Order,Reel) across several
+-- consecutive columns while one reel runs (and repeats [Var count] with it) ->
+-- LAG-dedup consecutive identical (Supplier,Order,Reel) tuples, keep the first
+-- column of each run, ROW_NUMBER survivors into seq = true reel order. Supplier
+-- is in the key so a supplier change on the same (order,reel) is NOT collapsed
+-- (it must survive to drive the per-supplier reset). supplier_barcode via
 -- decimal(38,0) cast to kill float scientific notation.
 --
 -- PALLET MATH (FLOOR/CEILING so a reel straddling a pallet boundary flags
@@ -126,42 +129,45 @@ GO
 -- ------------------------------------------------------------
 -- VIEW B : v_reel_pallet_map
 -- One row per (reel, pallet) -> the many-to-many recall surface.
--- Columns: id, product_id, order_no, supplier_barcode, pallet_no
--- Pallet numbers RESET to 1 per order_no, so recall lookups need both:
+-- Columns: id, product_id, order_no, supplier_no, supplier_barcode, pallet_no
+-- RESET CHANGED 2026-06-19: pallet numbers RESET to 1 per SUPPLIER change (was
+-- per order_no). A reel change within one supplier keeps counting; a supplier
+-- change (supplier1->supplier2) restarts at pallet 1. Recall lookups need both:
 --   bad pallet: SELECT supplier_barcode FROM analytics.v_reel_pallet_map
---               WHERE id=@batch AND order_no=@order AND pallet_no=@pallet;
+--               WHERE id=@batch AND supplier_no=@supplier AND pallet_no=@pallet;
 --   bad reel:   ... WHERE supplier_barcode=@bc;  -> every pallet it touched.
+-- (order_no still exposed for reference.)
 -- ------------------------------------------------------------
 CREATE OR ALTER VIEW [analytics].[v_reel_pallet_map] AS
 WITH reel_raw AS (
     SELECT cpb.ID AS Batch_ID, cpb.[Product_ID] AS product_id, cpb.Machine,
-           v.N, v.ord, v.reel, v.varc
+           v.N, v.ord, v.reel, v.sup, v.varc
     FROM [dbo].[Change paper brik] cpb
     CROSS APPLY (VALUES
-        (1, cpb.[Order1], cpb.[Reel1], cpb.[Var count 1]),    (2, cpb.[Order2], cpb.[Reel2], cpb.[Var count 2]),
-        (3, cpb.[Order3], cpb.[Reel3], cpb.[Var count 3]),    (4, cpb.[Order4], cpb.[Reel4], cpb.[Var count 4]),
-        (5, cpb.[Order5], cpb.[Reel5], cpb.[Var count 5]),    (6, cpb.[Order6], cpb.[Reel6], cpb.[Var count 6]),
-        (7, cpb.[Order7], cpb.[Reel7], cpb.[Var count 7]),    (8, cpb.[Order8], cpb.[Reel8], cpb.[Var count 8]),
-        (9, cpb.[Order9], cpb.[Reel9], cpb.[Var count 9]),    (10, cpb.[Order10], cpb.[Reel10], cpb.[Var count 10]),
-        (11, cpb.[Order11], cpb.[Reel11], cpb.[Var count 11]),(12, cpb.[Order12], cpb.[Reel12], cpb.[Var count 12]),
-        (13, cpb.[Order13], cpb.[Reel13], cpb.[Var count 13]),(14, cpb.[Order14], cpb.[Reel14], cpb.[Var count 14]),
-        (15, cpb.[Order15], cpb.[Reel15], cpb.[Var count 15]),(16, cpb.[Order16], cpb.[Reel16], cpb.[Var count 16]),
-        (17, cpb.[Order17], cpb.[Reel17], cpb.[Var count 17]),(18, cpb.[Order18], cpb.[Reel18], cpb.[Var count 18]),
-        (19, cpb.[Order19], cpb.[Reel19], cpb.[Var count 19]),(20, cpb.[Order20], cpb.[Reel20], cpb.[Var count 20]),
-        (21, cpb.[Order21], cpb.[Reel21], cpb.[Var count 21]),(22, cpb.[Order22], cpb.[Reel22], cpb.[Var count 22]),
-        (23, cpb.[Order23], cpb.[Reel23], cpb.[Var count 23]),(24, cpb.[Order24], cpb.[Reel24], cpb.[Var count 24]),
-        (25, cpb.[Order25], cpb.[Reel25], cpb.[Var count 25]),(26, cpb.[Order26], cpb.[Reel26], cpb.[Var count 26]),
-        (27, cpb.[Order27], cpb.[Reel27], cpb.[Var count 27]),(28, cpb.[Order28], cpb.[Reel28], cpb.[Var count 28]),
-        (29, cpb.[Order29], cpb.[Reel29], cpb.[Var count 29]),(30, cpb.[Order30], cpb.[Reel30], cpb.[Var count 30]),
-        (31, cpb.[Order31], cpb.[Reel31], cpb.[Var count 31]),(32, cpb.[Order32], cpb.[Reel32], cpb.[Var count 32]),
-        (33, cpb.[Order33], cpb.[Reel33], cpb.[Var count 33]),(34, cpb.[Order34], cpb.[Reel34], cpb.[Var count 34]),
-        (35, cpb.[Order35], cpb.[Reel35], cpb.[Var count 35]),(36, cpb.[Order36], cpb.[Reel36], cpb.[Var count 36]),
-        (37, cpb.[Order37], cpb.[Reel37], cpb.[Var count 37]),(38, cpb.[Order38], cpb.[Reel38], cpb.[Var count 38]),
-        (39, cpb.[Order39], cpb.[Reel39], cpb.[Var count 39]),(40, cpb.[Order40], cpb.[Reel40], cpb.[Var count 40]),
-        (41, cpb.[Order41], cpb.[Reel41], cpb.[Var count 41]),(42, cpb.[Order42], cpb.[Reel42], cpb.[Var count 42]),
-        (43, cpb.[Order43], cpb.[Reel43], cpb.[Var count 43]),(44, cpb.[Order44], cpb.[Reel44], cpb.[Var count 44]),
-        (45, cpb.[Order45], cpb.[Reel45], cpb.[Var count 45])
-    ) v(N, ord, reel, varc)
+        (1, cpb.[Order1], cpb.[Reel1], cpb.[Supplier1], cpb.[Var count 1]),    (2, cpb.[Order2], cpb.[Reel2], cpb.[Supplier2], cpb.[Var count 2]),
+        (3, cpb.[Order3], cpb.[Reel3], cpb.[Supplier3], cpb.[Var count 3]),    (4, cpb.[Order4], cpb.[Reel4], cpb.[Supplier4], cpb.[Var count 4]),
+        (5, cpb.[Order5], cpb.[Reel5], cpb.[Supplier5], cpb.[Var count 5]),    (6, cpb.[Order6], cpb.[Reel6], cpb.[Supplier6], cpb.[Var count 6]),
+        (7, cpb.[Order7], cpb.[Reel7], cpb.[Supplier7], cpb.[Var count 7]),    (8, cpb.[Order8], cpb.[Reel8], cpb.[Supplier8], cpb.[Var count 8]),
+        (9, cpb.[Order9], cpb.[Reel9], cpb.[Supplier9], cpb.[Var count 9]),    (10, cpb.[Order10], cpb.[Reel10], cpb.[Supplier10], cpb.[Var count 10]),
+        (11, cpb.[Order11], cpb.[Reel11], cpb.[Supplier11], cpb.[Var count 11]),(12, cpb.[Order12], cpb.[Reel12], cpb.[Supplier12], cpb.[Var count 12]),
+        (13, cpb.[Order13], cpb.[Reel13], cpb.[Supplier13], cpb.[Var count 13]),(14, cpb.[Order14], cpb.[Reel14], cpb.[Supplier14], cpb.[Var count 14]),
+        (15, cpb.[Order15], cpb.[Reel15], cpb.[Supplier15], cpb.[Var count 15]),(16, cpb.[Order16], cpb.[Reel16], cpb.[Supplier16], cpb.[Var count 16]),
+        (17, cpb.[Order17], cpb.[Reel17], cpb.[Supplier17], cpb.[Var count 17]),(18, cpb.[Order18], cpb.[Reel18], cpb.[Supplier18], cpb.[Var count 18]),
+        (19, cpb.[Order19], cpb.[Reel19], cpb.[Supplier19], cpb.[Var count 19]),(20, cpb.[Order20], cpb.[Reel20], cpb.[Supplier20], cpb.[Var count 20]),
+        (21, cpb.[Order21], cpb.[Reel21], cpb.[Supplier21], cpb.[Var count 21]),(22, cpb.[Order22], cpb.[Reel22], cpb.[Supplier22], cpb.[Var count 22]),
+        (23, cpb.[Order23], cpb.[Reel23], cpb.[Supplier23], cpb.[Var count 23]),(24, cpb.[Order24], cpb.[Reel24], cpb.[Supplier24], cpb.[Var count 24]),
+        (25, cpb.[Order25], cpb.[Reel25], cpb.[Supplier25], cpb.[Var count 25]),(26, cpb.[Order26], cpb.[Reel26], cpb.[Supplier26], cpb.[Var count 26]),
+        (27, cpb.[Order27], cpb.[Reel27], cpb.[Supplier27], cpb.[Var count 27]),(28, cpb.[Order28], cpb.[Reel28], cpb.[Supplier28], cpb.[Var count 28]),
+        (29, cpb.[Order29], cpb.[Reel29], cpb.[Supplier29], cpb.[Var count 29]),(30, cpb.[Order30], cpb.[Reel30], cpb.[Supplier30], cpb.[Var count 30]),
+        (31, cpb.[Order31], cpb.[Reel31], cpb.[Supplier31], cpb.[Var count 31]),(32, cpb.[Order32], cpb.[Reel32], cpb.[Supplier32], cpb.[Var count 32]),
+        (33, cpb.[Order33], cpb.[Reel33], cpb.[Supplier33], cpb.[Var count 33]),(34, cpb.[Order34], cpb.[Reel34], cpb.[Supplier34], cpb.[Var count 34]),
+        (35, cpb.[Order35], cpb.[Reel35], cpb.[Supplier35], cpb.[Var count 35]),(36, cpb.[Order36], cpb.[Reel36], cpb.[Supplier36], cpb.[Var count 36]),
+        (37, cpb.[Order37], cpb.[Reel37], cpb.[Supplier37], cpb.[Var count 37]),(38, cpb.[Order38], cpb.[Reel38], cpb.[Supplier38], cpb.[Var count 38]),
+        (39, cpb.[Order39], cpb.[Reel39], cpb.[Supplier39], cpb.[Var count 39]),(40, cpb.[Order40], cpb.[Reel40], cpb.[Supplier40], cpb.[Var count 40]),
+        (41, cpb.[Order41], cpb.[Reel41], cpb.[Supplier41], cpb.[Var count 41]),(42, cpb.[Order42], cpb.[Reel42], cpb.[Supplier42], cpb.[Var count 42]),
+        (43, cpb.[Order43], cpb.[Reel43], cpb.[Supplier43], cpb.[Var count 43]),(44, cpb.[Order44], cpb.[Reel44], cpb.[Supplier44], cpb.[Var count 44]),
+        (45, cpb.[Order45], cpb.[Reel45], cpb.[Supplier45], cpb.[Var count 45])
+    ) v(N, ord, reel, sup, varc)
     WHERE cpb.Machine LIKE 'M%'          -- Group M only (v1 functional scope, kept)
       -- DE-SCOPED 2026-06-19: removed the two "currently-running-batch" guards
       -- so finished batches no longer disappear -> view now covers ALL HISTORY.
@@ -170,46 +176,54 @@ WITH reel_raw AS (
       AND v.ord IS NOT NULL
 ),
 reel_dd AS (
-    SELECT Batch_ID, product_id, Machine, N, ord, reel, varc,
+    SELECT Batch_ID, product_id, Machine, N, ord, reel, sup, varc,
            LAG(ord)  OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_ord,
-           LAG(reel) OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_reel
+           LAG(reel) OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_reel,
+           LAG(sup)  OVER (PARTITION BY Batch_ID ORDER BY N) AS prev_sup
     FROM reel_raw
 ),
 reel AS (
-    SELECT Batch_ID, product_id, Machine, ord,
+    SELECT Batch_ID, product_id, Machine, ord, sup,
            ROW_NUMBER() OVER (PARTITION BY Batch_ID ORDER BY N) AS seq,
            ISNULL(varc, 0) AS varc,
            CAST(CAST(ord AS decimal(38,0)) AS varchar(50)) AS order_no,
+           CAST(CAST(sup AS decimal(38,0)) AS varchar(50)) AS supplier_no,
            CAST(CAST(ord  AS decimal(38,0)) AS varchar(50))
          + CAST(CAST(reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
     FROM reel_dd
-    WHERE prev_ord IS NULL
-       OR ord <> prev_ord OR reel <> prev_reel
+    -- DEDUP keyed on (supplier, order, reel): supplier is part of the reel
+    -- identity so a supplier change landing on the same (order,reel) is NOT
+    -- collapsed away -> it survives to drive the per-supplier reset below.
+    WHERE prev_sup IS NULL OR prev_ord IS NULL
+       OR sup <> prev_sup OR ord <> prev_ord OR reel <> prev_reel
 ),
 cum AS (
-    SELECT Batch_ID, product_id, order_no, supplier_barcode, ord, varc, seq,
+    SELECT Batch_ID, product_id, order_no, supplier_no, supplier_barcode, sup, varc, seq,
            SUM(varc) OVER (PARTITION BY Batch_ID ORDER BY seq
                            ROWS UNBOUNDED PRECEDING) AS end_count
     FROM reel
 ),
-ordtag AS (
-    SELECT *, LAG(ord) OVER (PARTITION BY Batch_ID ORDER BY seq) AS prev_ord_seq
+suptag AS (
+    SELECT *, LAG(sup) OVER (PARTITION BY Batch_ID ORDER BY seq) AS prev_sup_seq
     FROM cum
 ),
-ordrun AS (
+suprun AS (
+    -- supplier_run = running count of SUPPLIER changes in the batch = the reset
+    -- boundary (replaces order_run). Pallet restarts at 1 on each supplier
+    -- change; a reel change within one supplier keeps counting.
     SELECT *,
-           SUM(CASE WHEN prev_ord_seq IS NULL OR ord <> prev_ord_seq THEN 1 ELSE 0 END)
-               OVER (PARTITION BY Batch_ID ORDER BY seq ROWS UNBOUNDED PRECEDING) AS order_run
-    FROM ordtag
+           SUM(CASE WHEN prev_sup_seq IS NULL OR sup <> prev_sup_seq THEN 1 ELSE 0 END)
+               OVER (PARTITION BY Batch_ID ORDER BY seq ROWS UNBOUNDED PRECEDING) AS supplier_run
+    FROM suptag
 ),
 rng AS (
     SELECT
-        Batch_ID AS id, product_id, order_no, supplier_barcode,
-        CONVERT(INT, FLOOR(((end_count - varc) - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, order_run)) / 4800.0) + 1) AS start_pallet,
-        CONVERT(INT, CEILING((end_count        - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, order_run)) / 4800.0))     AS end_pallet
-    FROM ordrun
+        Batch_ID AS id, product_id, order_no, supplier_no, supplier_barcode,
+        CONVERT(INT, FLOOR(((end_count - varc) - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, supplier_run)) / 4800.0) + 1) AS start_pallet,
+        CONVERT(INT, CEILING((end_count        - MIN(end_count - varc) OVER (PARTITION BY Batch_ID, supplier_run)) / 4800.0))     AS end_pallet
+    FROM suprun
 )
-SELECT rng.id, rng.product_id, rng.order_no, rng.supplier_barcode, p.pallet_no
+SELECT rng.id, rng.product_id, rng.order_no, rng.supplier_no, rng.supplier_barcode, p.pallet_no
 FROM rng
 CROSS APPLY (
     SELECT TOP (rng.end_pallet - rng.start_pallet + 1)
