@@ -187,7 +187,8 @@ reel AS (
            ROW_NUMBER() OVER (PARTITION BY Batch_ID ORDER BY N) AS seq,
            ISNULL(varc, 0) AS varc,
            CAST(CAST(ord AS decimal(38,0)) AS varchar(50)) AS order_no,
-           CAST(CAST(sup AS decimal(38,0)) AS varchar(50)) AS supplier_no,
+           CAST(sup AS varchar(50)) AS supplier_no,   -- [SupplierN] is nvarchar (text) -> no decimal cast
+
            CAST(CAST(ord  AS decimal(38,0)) AS varchar(50))
          + CAST(CAST(reel AS decimal(38,0)) AS varchar(50)) AS supplier_barcode
     FROM reel_dd
