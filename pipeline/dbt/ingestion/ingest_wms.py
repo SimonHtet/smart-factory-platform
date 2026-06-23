@@ -12,7 +12,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 # and target_table.
 # ---------------------------------------------------------------------------
 
-WMS_INITIAL_CUTOFF = "2026-03-30"
+WMS_INITIAL_CUTOFF = "2025-12-31"
 BATCH_SIZE = 5000
 
 JOBS = [

@@ -15,13 +15,11 @@ select
     t.MachineCode                                               as machine_code,
     t.GroupCode                                                 as group_code,
     t.filler_code,
-    ri.plan_production_date,
-    CONVERT(varchar, CAST(ri.plan_production_date as date), 112)
+    CAST(t.ProductionDate as date)                              as plan_production_date,
+    CONVERT(varchar, CAST(t.ProductionDate as date), 112)
         + t.filler_code                                         as run_key,
     TRY_CAST(t.InCartonAmount as decimal(18,2))
         * TRY_CAST(mp.numbit as decimal(18,2))                  as total_briks_amount
 from deduped t
-left join {{ ref('stg_wms_receive_item') }} ri
-    on t.ReceivedNo = ri.received_no
 left join {{ source('analytics', 'raw_wms_mst_product') }} mp
     on t.ProductId = mp.ProductId
