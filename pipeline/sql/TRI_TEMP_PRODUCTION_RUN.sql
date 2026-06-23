@@ -40,6 +40,11 @@ CREATE TABLE [analytics].[temp_production_run] (
     total_downtime_seconds   INT,
     total_downtime_minutes   FLOAT,
     downtime_lost_briks      FLOAT,
+    de_downtime_count            INT,    -- [V5.8] DE-line down episodes
+    de_downtime_seconds          INT,    -- [V5.8] DE-line down total
+    de_downtime_minutes          FLOAT,
+    tba_actual_downtime_seconds  INT,    -- [V5.8] total_downtime - de_downtime (>=0)
+    tba_actual_downtime_minutes  FLOAT,
     efficiency_outfeed       FLOAT,
     efficiency_scanned       FLOAT,
     efficiency_lost_downtime FLOAT,
@@ -176,7 +181,9 @@ BEGIN
                 i.counter_outfeed                                                AS out_feed_mc,
                 ISNULL(cpb.[total_Var_Brik], 0)                                 AS scanned_briks,
                 ISNULL(cpb.[Downtime_Count], 0)                                 AS downtime_count,
-                ISNULL(cpb.[Total_Downtime_Seconds], 0)                         AS total_downtime_seconds
+                ISNULL(cpb.[Total_Downtime_Seconds], 0)                         AS total_downtime_seconds,
+                ISNULL(cpb.[DE_Downtime_Count], 0)                              AS de_downtime_count,
+                ISNULL(cpb.[Total_DE_Downtime_Seconds], 0)                      AS de_downtime_seconds
             FROM inserted i
             JOIN deleted d ON i.Machine = d.Machine
             JOIN [dbo].[Change paper brik] cpb
@@ -201,6 +208,15 @@ BEGIN
             tgt.total_downtime_seconds = src.total_downtime_seconds,
             tgt.total_downtime_minutes = src.total_downtime_seconds / 60.0,
             tgt.downtime_lost_briks    = (src.total_downtime_seconds / 60.0) * 400,
+
+            -- [V5.8] DE-line downtime + TBA actual (own-fault) downtime
+            tgt.de_downtime_count           = src.de_downtime_count,
+            tgt.de_downtime_seconds         = src.de_downtime_seconds,
+            tgt.de_downtime_minutes         = src.de_downtime_seconds / 60.0,
+            tgt.tba_actual_downtime_seconds = CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                                                   THEN src.total_downtime_seconds - src.de_downtime_seconds ELSE 0 END,
+            tgt.tba_actual_downtime_minutes = CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                                                   THEN (src.total_downtime_seconds - src.de_downtime_seconds) / 60.0 ELSE 0 END,
 
             -- Counter lock: frozen once closed; zero-guard on open batches
             tgt.in_feed_mc  = CASE
@@ -256,6 +272,8 @@ BEGIN
             start_time, end_time, end_time_cip, run_duration_minutes,
             in_feed_mc, out_feed_mc, waste_tba, waste_tba_pct, scanned_briks, waste_op,
             downtime_count, total_downtime_seconds, total_downtime_minutes, downtime_lost_briks,
+            de_downtime_count, de_downtime_seconds, de_downtime_minutes,
+            tba_actual_downtime_seconds, tba_actual_downtime_minutes,
             efficiency_outfeed, efficiency_scanned, efficiency_lost_downtime,
             last_updated
         ) VALUES (
@@ -274,6 +292,13 @@ BEGIN
             src.total_downtime_seconds,
             src.total_downtime_seconds / 60.0,
             (src.total_downtime_seconds / 60.0) * 400,
+            src.de_downtime_count,
+            src.de_downtime_seconds,
+            src.de_downtime_seconds / 60.0,
+            CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                 THEN src.total_downtime_seconds - src.de_downtime_seconds ELSE 0 END,
+            CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                 THEN (src.total_downtime_seconds - src.de_downtime_seconds) / 60.0 ELSE 0 END,
             CASE
                 WHEN src.out_feed_mc  > 0 AND src.run_duration_minutes > 0
                     THEN src.out_feed_mc  / (src.run_duration_minutes * 400.0)
@@ -331,7 +356,9 @@ src AS (
         cpb.[Out_Feed_MC]                                      AS out_feed_mc,
         ISNULL(cpb.[total_Var_Brik], 0)                       AS scanned_briks,
         ISNULL(cpb.[Downtime_Count], 0)                       AS downtime_count,
-        ISNULL(cpb.[Total_Downtime_Seconds], 0)               AS total_downtime_seconds
+        ISNULL(cpb.[Total_Downtime_Seconds], 0)               AS total_downtime_seconds,
+        ISNULL(cpb.[DE_Downtime_Count], 0)                    AS de_downtime_count,
+        ISNULL(cpb.[Total_DE_Downtime_Seconds], 0)            AS de_downtime_seconds
     FROM base b
     JOIN [dbo].[Change paper brik] cpb ON cpb.ID = b.max_id
 )
@@ -346,6 +373,13 @@ SET
     tpr.total_downtime_seconds = src.total_downtime_seconds,
     tpr.total_downtime_minutes = src.total_downtime_seconds / 60.0,
     tpr.downtime_lost_briks    = (src.total_downtime_seconds / 60.0) * 400,
+    tpr.de_downtime_count           = src.de_downtime_count,
+    tpr.de_downtime_seconds         = src.de_downtime_seconds,
+    tpr.de_downtime_minutes         = src.de_downtime_seconds / 60.0,
+    tpr.tba_actual_downtime_seconds = CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                                           THEN src.total_downtime_seconds - src.de_downtime_seconds ELSE 0 END,
+    tpr.tba_actual_downtime_minutes = CASE WHEN src.total_downtime_seconds - src.de_downtime_seconds > 0
+                                           THEN (src.total_downtime_seconds - src.de_downtime_seconds) / 60.0 ELSE 0 END,
     tpr.in_feed_mc    = CASE WHEN src.in_feed_mc  > 0 THEN src.in_feed_mc  ELSE tpr.in_feed_mc  END,
     tpr.out_feed_mc   = CASE WHEN src.out_feed_mc > 0 THEN src.out_feed_mc ELSE tpr.out_feed_mc END,
     tpr.waste_tba     = CASE WHEN src.in_feed_mc > 0 AND src.out_feed_mc > 0 THEN src.in_feed_mc - src.out_feed_mc ELSE tpr.waste_tba END,
