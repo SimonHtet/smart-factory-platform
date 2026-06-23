@@ -16,7 +16,9 @@ with production as (
         waste_tba,
         scanned_briks,
         downtime_count,
-        total_downtime_seconds
+        total_downtime_seconds,
+        de_downtime_count,
+        total_de_downtime_seconds
     from {{ ref('stg_change_paper_brik') }}
 ),
 
@@ -76,7 +78,14 @@ select
 
     -- downtime
     p.downtime_count,
-    p.total_downtime_seconds
+    p.total_downtime_seconds,
+
+    -- V5.8 DE-line downtime + isolated TBA-actual downtime (floored at 0)
+    p.de_downtime_count,
+    p.total_de_downtime_seconds,
+    CASE WHEN p.total_downtime_seconds - p.total_de_downtime_seconds > 0
+         THEN p.total_downtime_seconds - p.total_de_downtime_seconds
+         ELSE 0 END                                             as tba_actual_downtime_seconds
 
 from production p
 left join wms w on p.run_key = w.run_key

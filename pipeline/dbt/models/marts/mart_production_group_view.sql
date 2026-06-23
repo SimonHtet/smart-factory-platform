@@ -21,6 +21,7 @@ select
     -- run counts
     COUNT(*)                                                    as run_count,
     SUM(downtime_count)                                         as downtime_count,
+    SUM(de_downtime_count)                                      as de_downtime_count,
 
     -- volume
     SUM(in_feed_mc)                                             as in_feed_mc,
@@ -38,6 +39,9 @@ select
     -- time
     SUM(run_duration_minutes)                                   as total_run_minutes,
     SUM(total_downtime_seconds) / 60.0                          as total_downtime_minutes,
+    -- V5.8: DE-line vs TBA-actual downtime split (DE stall not the filler's fault)
+    SUM(total_de_downtime_seconds) / 60.0                       as de_downtime_minutes,
+    SUM(tba_actual_downtime_seconds) / 60.0                     as tba_actual_downtime_minutes,
 
     -- derived KPIs
     CAST(SUM(fg_briks_amount) AS float)

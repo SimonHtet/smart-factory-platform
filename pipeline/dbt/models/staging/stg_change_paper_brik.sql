@@ -15,6 +15,10 @@ select
     [End_time_CIP]                          as end_time_cip,
     ISNULL([Downtime_Count], 0)             as downtime_count,
     ISNULL([Total_Downtime_Seconds], 0)     as total_downtime_seconds,
+    -- V5.8: DE-line downtime (DE stall that idles the TBA filler, not the
+    -- filler's own fault). Isolated so total can be split into tba-actual vs DE.
+    ISNULL([DE_Downtime_Count], 0)          as de_downtime_count,
+    ISNULL([Total_DE_Downtime_Seconds], 0)  as total_de_downtime_seconds,
     CONVERT(varchar, [Product Date], 112) + [Machine]  as run_key
 from {{ source('dbo', 'Change paper brik') }}
 where [Product Date] is not null
