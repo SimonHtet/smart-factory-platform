@@ -41,6 +41,16 @@
 -- stay splittable (matches the >30-min breakdown classification).
 -- OPEN rows are excluded (not finished); VOID rows are excluded (FCIP
 -- = intentional end, not a loss).
+--
+-- 2026-06-23 — DE-LINE DOWNTIME exposure (pairs with V5.8)
+-- -------------------------------------------------------
+-- A DE-line stall idles the TBA filler through no fault of its own.
+-- temp_production_run now carries de_downtime_* and tba_actual_downtime_*
+-- (TRI_TEMP_PRODUCTION_RUN reads Total_DE_Downtime_Seconds off
+-- [Change paper brik]; tba_actual = total - de, floored at 0). This view
+-- just SUMs them per group so the director rollup can split DE-line loss
+-- from the filler's own downtime. Kept SEPARATE from downtime_* and
+-- big_downtime_* so all three stay independently reportable.
 -- ============================================================
 
 CREATE OR ALTER VIEW [analytics].[v_group_production_run] AS
@@ -102,6 +112,12 @@ grouped AS (
         SUM(big_dt_seconds)                     AS big_downtime_seconds,
         SUM(big_dt_seconds) / 60.0              AS big_downtime_minutes,
         (SUM(big_dt_seconds) / 60.0) * 400      AS big_downtime_lost_briks,
+        SUM(de_downtime_count)                  AS de_downtime_count,
+        SUM(de_downtime_seconds)                AS de_downtime_seconds,
+        SUM(de_downtime_seconds) / 60.0         AS de_downtime_minutes,
+        (SUM(de_downtime_seconds) / 60.0) * 400 AS de_downtime_lost_briks,
+        SUM(tba_actual_downtime_seconds)        AS tba_actual_downtime_seconds,
+        SUM(tba_actual_downtime_seconds) / 60.0 AS tba_actual_downtime_minutes,
         MAX(last_updated)                       AS last_updated
     FROM tpr
     WHERE machine LIKE 'A%' OR machine LIKE 'D%' OR machine LIKE 'M%'
@@ -132,6 +148,12 @@ grouped AS (
         big_dt_seconds                          AS big_downtime_seconds,
         big_dt_seconds / 60.0                   AS big_downtime_minutes,
         (big_dt_seconds / 60.0) * 400           AS big_downtime_lost_briks,
+        de_downtime_count                       AS de_downtime_count,
+        de_downtime_seconds                     AS de_downtime_seconds,
+        de_downtime_seconds / 60.0              AS de_downtime_minutes,
+        (de_downtime_seconds / 60.0) * 400      AS de_downtime_lost_briks,
+        tba_actual_downtime_seconds             AS tba_actual_downtime_seconds,
+        tba_actual_downtime_seconds / 60.0      AS tba_actual_downtime_minutes,
         last_updated
     FROM tpr
     WHERE machine IN ('B1', 'B2')
@@ -153,10 +175,17 @@ SELECT
     big_downtime_seconds,
     big_downtime_minutes,
     big_downtime_lost_briks,
+    de_downtime_count,
+    de_downtime_seconds,
+    de_downtime_minutes,
+    de_downtime_lost_briks,
+    tba_actual_downtime_seconds,
+    tba_actual_downtime_minutes,
     out_feed_mc   / NULLIF(total_run_duration_minutes * 400.0, 0)       AS efficiency_outfeed,
     scanned_briks / NULLIF(total_run_duration_minutes * 400.0, 0)       AS efficiency_scanned,
     downtime_lost_briks     / NULLIF(out_feed_mc, 0)                    AS efficiency_lost_downtime,
     big_downtime_lost_briks / NULLIF(out_feed_mc, 0)                    AS efficiency_lost_big_downtime,
+    de_downtime_lost_briks  / NULLIF(out_feed_mc, 0)                    AS efficiency_lost_de,
     last_updated,
     CASE
         WHEN product_date = MAX(product_date) OVER (PARTITION BY machine_group)
