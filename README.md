@@ -19,12 +19,15 @@ Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was neve
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V5.6.sql` | Main event trigger on `T_M_Filler_Process` — V5.5 + big-downtime *duration* tracking (`Big_Downtime_log`): a breakdown goes `11→8→7→12→13→14` (no CIP) and aborts out of the mini-stoppage logic, so its time loss is captured separately. *(latest)* |
+| `TRI_UPDATE_FILLER_V5.8.sql` | Main event trigger on `T_M_Filler_Process` — V5.7 + **DE-line downtime isolation**: edge-detects the upstream feed's not-ready signal so the filler's *actual* downtime can be separated from idle time it didn't cause. *(latest)* |
+| `TRI_UPDATE_FILLER_V5.7.sql` | V5.6 + **reel→pallet traceability capture**: logs the outfeed counter at each real reel splice to `Reel_Splice_log` for recall genealogy. Superseded by V5.8. |
+| `TRI_UPDATE_FILLER_V5.6.sql` | V5.5 + big-downtime *duration* tracking (`Big_Downtime_log`): a breakdown goes `11→8→7→12→13→14` (no CIP) and aborts out of the mini-stoppage logic, so its time loss is captured separately. |
 | `TRI_UPDATE_FILLER_V5.5.sql` | V5.4 + big-downtime *throughput* correction (`Feed_Segment_log`): the feed counter resets to 0 mid-batch without a CIP (`130000→0→150000`); pre-reset values are logged and re-summed so totals are correct. |
-| `TRI_UPDATE_FILLER_V5.4.sql` | Splice tracking, mini-downtime segments, CIP end time — superseded by V5.5/V5.6 |
-| `TRI_UPDATE_FILLER_V5.3.sql` | Previous version — superseded |
-| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08; includes `TRI_UPDATE_SCANNED_BRIKS` (Step 4) for late scan support *(live)* |
-| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual; adds back big-downtime feed loss (V5.5) and exposes big-downtime time loss (V5.6), separate from mini-stoppage downtime |
+| `TRI_UPDATE_FILLER_V5.4.sql` | Splice tracking, mini-downtime segments, CIP end time — superseded |
+| `DE_DOWNTIME_SETUP.sql` | One-time setup for V5.8 — creates `DE_Downtime_log` and the supporting columns. |
+| `V_REEL_PALLET.sql` | Reel→pallet recall views (`v_reel_pallet_estimate`, `v_reel_pallet_map`) — see Traceability section below. |
+| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08; surfaces DE-downtime + actual-downtime columns (V5.8); includes `TRI_UPDATE_SCANNED_BRIKS` (Step 4) for late scan support *(live)* |
+| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual; adds back big-downtime feed loss (V5.5), exposes big-downtime time loss (V5.6) and DE-line downtime (V5.8), each separate from mini-stoppage downtime |
 
 **Big-downtime model (A/B/D/M, the CIP groups):** a real breakdown resets the OPMS feed counter to 0 and does an intermediate CIP (ICIP) with **no `Signal_Final_CIP`**, vs a normal finish which raises it (FCIP). `End_time_CIP IS NULL` is the single discriminator throughout — no CIP ⇒ same batch continuing (accumulate throughput + count the time loss); CIP ⇒ legitimate run end (ignore).
 
@@ -99,9 +102,9 @@ PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.6 *(latest)*
+## SQL Trigger — TRI_UPDATE_FILLER_V5.8 *(latest)*
 
-Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table.
+Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version is strictly additive — V5.8 carries forward everything below and adds reel-splice capture (V5.7) and DE-line downtime isolation (V5.8).
 
 **Events handled:**
 
@@ -119,6 +122,9 @@ Sub-second event capture for splice signals (~10ms pulse — too fast for Python
 | Step 7 → 12 | `_BDL:OPEN` (V5.6) | Open `Big_Downtime_log` row (big-downtime time loss starts) |
 | Step 14 + CIP=1 | `_BDL:VOID` (V5.6) | FCIP ⇒ intentional end ⇒ void the open big-downtime row |
 | → Step 11 | `_BDL:CLOSE` (V5.6) | Resume with no CIP ⇒ close row, stamp duration (the loss) |
+| real reel splice | `_RS` (V5.7) | Log outfeed counter to `Reel_Splice_log` (`Splice_No` = kth end-roll) for recall genealogy |
+| `signal_DE_NotReady` 0→1 | `_DE:START` (V5.8) | Open `DE_Downtime_log` row — upstream feed not ready, stamp start |
+| `signal_DE_NotReady` 1→0 | `_DE:END` (V5.8) | Close row, stamp `Duration_Seconds`, add to the batch's `Total_DE_Downtime_Seconds` |
 
 **Open batch detection (Step 13 guard — V5.4):**
 
@@ -128,6 +134,30 @@ Sub-second event capture for splice signals (~10ms pulse — too fast for Python
 | F / G / H / K | `[end time] IS NULL` — write once |
 
 > "Breakdown" in company terms means >30 min — that classification is applied at the reporting layer, not in the trigger.
+
+---
+
+## Reel → Pallet Traceability (Recall Genealogy)
+
+Reverse traceability for product recall: a bad finished pallet → the supplier reel(s) that fed it → every other pallet those reels touched. Views: `v_reel_pallet_estimate` (reel-level), `v_reel_pallet_map` (the many-to-many recall surface). Files: `V_REEL_PALLET.sql`, `TRI_UPDATE_FILLER_V5.7.sql`.
+
+**Method — supplier-declared counts, cumulative-summed (exact, retroactive):** each reel slot on `[Change paper brik]` carries the briks the supplier declares for that reel. Cumulatively summing them gives each reel a `start_count … end_count` span; dividing by the pallet size maps it to a pallet range, using `FLOOR`/`CEILING` so a reel straddling a boundary is flagged for **both** pallets (recall-safe over-inclusion).
+
+**Why not the live outfeed counter:** capturing the counter at each splice is more precise on waste, but the raw counter *resets* mid-run (`1 → 130k → repeat`) and depends on catching every reset — one missed reset silently points a recall at the wrong product. The supplier-count method is **monotonic by construction**: its error is small, bounded, and washes out once the warehouse real-number reconciliation takes over. **Design rule: for recall, a bounded predictable error beats a silent catastrophic one.** (The counter-at-splice variant is kept in `Reel_Splice_log` for a future counter-accurate version on a clean full batch.)
+
+Two raw-data quirks handled in the views: the PLC repeats the same `(Order, Reel)` across consecutive columns while one reel runs (deduped via `LAG` + `ROW_NUMBER`), and pallet numbering resets per customer order (so recall-by-pallet filters `order_no` + `pallet_no`).
+
+---
+
+## DE-Line Downtime Isolation (V5.8)
+
+The TBA filler sits idle whenever the upstream DE line isn't ready — time that was previously buried inside total downtime and unfairly charged to the filler. V5.8 edge-detects `signal_DE_NotReady` (0=OK, 1=down) on every machine: `0→1` opens a `DE_Downtime_log` row, `1→0` closes it and accumulates the duration onto the batch. The analytics layer then computes:
+
+```
+tba_actual_downtime = total_downtime − de_downtime     (floored at 0)
+```
+
+so efficiency KPIs reflect the filler's *true* performance. Pure binary edge — no step machine, no segments — and strictly additive over V5.7. `DE_DOWNTIME_SETUP.sql` creates the log table and supporting columns; `temp_production_run` and `v_group_production_run` surface both the raw DE downtime and the corrected actual-downtime figures, kept separate from mini- and big-downtime so each loss category stays auditable.
 
 ---
 
