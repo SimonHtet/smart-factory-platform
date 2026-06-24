@@ -123,7 +123,7 @@ Sub-second event capture for splice signals (~10ms pulse — too fast for Python
 | Step 14 + CIP=1 | `_BDL:VOID` (V5.6) | FCIP ⇒ intentional end ⇒ void the open big-downtime row |
 | → Step 11 | `_BDL:CLOSE` (V5.6) | Resume with no CIP ⇒ close row, stamp duration (the loss) |
 | real reel splice | `_RS` (V5.7) | Log outfeed counter to `Reel_Splice_log` (`Splice_No` = kth end-roll) for recall genealogy |
-| `signal_DE_NotReady` 0→1 | `_DE:START` (V5.8) | Open `DE_Downtime_log` row — upstream feed not ready, stamp start |
+| `signal_DE_NotReady` 0→1 | `_DE:START` (V5.8) | Open `DE_Downtime_log` row — upstream feed not ready, stamp start (only once past Step 10 / motor start) |
 | `signal_DE_NotReady` 1→0 | `_DE:END` (V5.8) | Close row, stamp `Duration_Seconds`, add to the batch's `Total_DE_Downtime_Seconds` |
 
 **Open batch detection (Step 13 guard — V5.4):**
@@ -158,6 +158,8 @@ tba_actual_downtime = total_downtime − de_downtime     (floored at 0)
 ```
 
 so efficiency KPIs reflect the filler's *true* performance. Pure binary edge — no step machine, no segments — and strictly additive over V5.7. `DE_DOWNTIME_SETUP.sql` creates the log table and supporting columns; `temp_production_run` and `v_group_production_run` surface both the raw DE downtime and the corrected actual-downtime figures, kept separate from mini- and big-downtime so each loss category stays auditable.
+
+**Motor-start gate (rev 2026-06-24):** a DE episode only opens once the filler has actually reached **Step 10 (motor start)** for the batch — detected via `[Splicing time 1] IS NOT NULL`, the same marker the Step 13 guard uses. A DE-not-ready signal raised during startup, before the production loop begins, isn't lost output and is ignored. The `1→0` close is a no-op when no episode was opened, so the guard sits entirely on the open side.
 
 ---
 
