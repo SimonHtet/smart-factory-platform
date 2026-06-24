@@ -27,6 +27,15 @@
 -- ALL machines (mirrors the mini-stoppage blocks, not A/B/D/M-gated).
 -- Requires DE_DOWNTIME_SETUP.sql first. t_log tags _DE:START / _DE:END.
 --
+-- REVISION 2026-06-24 : DE START now gated on [Splicing time 1] IS NOT NULL
+-- (= the filler reached Step 10 / motor start for this batch). A DE-not-ready
+-- signal raised BEFORE the production loop starts is startup, not lost output,
+-- so it no longer opens an episode. The 1->0 END is unchanged -- with no OPEN
+-- row it is simply a no-op. Edge case: a DE stall whose 0->1 edge happens
+-- before motor start is ignored entirely even if it overlaps the start of
+-- production (we only see edges, not levels) -- acceptable per "don't count
+-- the signal before motor start".
+--
 -- WHAT CHANGED IN V5.7  (2026-06-17)
 -- -------------------------------------------------------
 -- REEL -> PALLET TRACEABILITY capture (recall support).
@@ -1080,10 +1089,21 @@ BEGIN
 
             WHILE @@FETCH_STATUS = 0
             BEGIN
+                -- [V5.8 rev 2026-06-24] Gate DE downtime on the filler having
+                -- actually reached motor start (Step 10). Step 10 stamps
+                -- [Splicing time 1], so [Splicing time 1] IS NOT NULL = "the
+                -- production loop has started for this batch" (same marker the
+                -- Step 13 guard uses). A DE-not-ready signal during startup,
+                -- BEFORE motor start, is not lost production time -- the filler
+                -- isn't producing yet -- so it must NOT open a DE episode.
+                -- If the batch hasn't started, @GID_DE stays NULL and nothing
+                -- is logged; the matching 1->0 END then finds no OPEN row and
+                -- is a no-op. Mirrors how mini-downtime only counts once running.
                 SELECT @GID_DE = MAX(ID)
                 FROM [Change paper brik] WITH (UPDLOCK, HOLDLOCK)
                 WHERE Machine = @cur_Machine_DE
                 AND [end time] IS NULL
+                AND [Splicing time 1] IS NOT NULL
 
                 IF @GID_DE IS NOT NULL
                 AND NOT EXISTS (SELECT 1 FROM [DE_Downtime_log] WHERE Batch_ID = @GID_DE AND Status = 'OPEN')
