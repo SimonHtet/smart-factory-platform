@@ -145,7 +145,7 @@ Reverse traceability for product recall: a bad finished pallet → the supplier 
 
 **Why not the live outfeed counter:** capturing the counter at each splice is more precise on waste, but the raw counter *resets* mid-run (`1 → 130k → repeat`) and depends on catching every reset — one missed reset silently points a recall at the wrong product. The supplier-count method is **monotonic by construction**: its error is small, bounded, and washes out once the warehouse real-number reconciliation takes over. **Design rule: for recall, a bounded predictable error beats a silent catastrophic one.** (The counter-at-splice variant is kept in `Reel_Splice_log` for a future counter-accurate version on a clean full batch.)
 
-Two raw-data quirks handled in the views: the PLC repeats the same `(Order, Reel)` across consecutive columns while one reel runs (deduped via `LAG` + `ROW_NUMBER`), and pallet numbering resets per customer order (so recall-by-pallet filters `order_no` + `pallet_no`).
+Two raw-data quirks handled in the views: the PLC repeats the same `(Order, Reel)` across consecutive columns while one reel runs (deduped via `LAG` + `ROW_NUMBER`), and pallet numbering resets per **supplier run** — a reel change within one supplier keeps counting, a supplier change restarts at 1 — so `pallet_no` is not unique per batch and recall-by-pallet filters `supplier_no` + `pallet_no` (`order_no` kept for reference).
 
 ---
 
