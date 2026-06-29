@@ -42,6 +42,13 @@
 -- those machines and NULL is written -- no guard needed, nothing breaks.
 -- Requires [Change paper brik].[In_Feed_DE_MC] to exist (ALTER TABLE ADD ... INT NULL).
 --
+-- REVISION 2026-06-29b : Step 13 also writes [Sampling_Waste] = counter_outfeed
+-- - counter_infeed_DE (sampling waste = outfeed minus DE infeed), computed from
+-- the same inserted row so it stays consistent with the two counters it derives
+-- from. When counter_infeed_DE is NULL (un-wired lines) the subtraction yields
+-- NULL -- i.e. no sampling-waste value on lines without a DE counter, which is
+-- the honest result. Requires [Change paper brik].[Sampling_Waste] to exist.
+--
 -- WHAT CHANGED IN V5.7  (2026-06-17)
 -- -------------------------------------------------------
 -- REEL -> PALLET TRACEABILITY capture (recall support).
@@ -245,10 +252,11 @@ BEGIN
         BEGIN
             UPDATE cpb
             SET
-                [end time]      = GETUTCDATE(),
-                [In_Feed_MC]    = i.counter_infeed,
-                [Out_Feed_MC]   = i.counter_outfeed,
-                [In_Feed_DE_MC] = i.counter_infeed_DE
+                [end time]       = GETUTCDATE(),
+                [In_Feed_MC]     = i.counter_infeed,
+                [Out_Feed_MC]    = i.counter_outfeed,
+                [In_Feed_DE_MC]  = i.counter_infeed_DE,
+                [Sampling_Waste] = i.counter_outfeed - i.counter_infeed_DE
             FROM [Change paper brik] cpb
             JOIN inserted i ON cpb.Machine = i.Machine
             WHERE cpb.[Splicing time 1] IS NOT NULL
