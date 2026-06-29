@@ -36,6 +36,12 @@
 -- production (we only see edges, not levels) -- acceptable per "don't count
 -- the signal before motor start".
 --
+-- REVISION 2026-06-29 : Step 13 now also snapshots the DE infeed counter --
+-- [In_Feed_DE_MC] = i.counter_infeed_DE, alongside the existing In/Out feed
+-- counters. Most lines have no DE counter wired yet, so the source is NULL on
+-- those machines and NULL is written -- no guard needed, nothing breaks.
+-- Requires [Change paper brik].[In_Feed_DE_MC] to exist (ALTER TABLE ADD ... INT NULL).
+--
 -- WHAT CHANGED IN V5.7  (2026-06-17)
 -- -------------------------------------------------------
 -- REEL -> PALLET TRACEABILITY capture (recall support).
@@ -239,9 +245,10 @@ BEGIN
         BEGIN
             UPDATE cpb
             SET
-                [end time]    = GETUTCDATE(),
-                [In_Feed_MC]  = i.counter_infeed,
-                [Out_Feed_MC] = i.counter_outfeed
+                [end time]      = GETUTCDATE(),
+                [In_Feed_MC]    = i.counter_infeed,
+                [Out_Feed_MC]   = i.counter_outfeed,
+                [In_Feed_DE_MC] = i.counter_infeed_DE
             FROM [Change paper brik] cpb
             JOIN inserted i ON cpb.Machine = i.Machine
             WHERE cpb.[Splicing time 1] IS NOT NULL

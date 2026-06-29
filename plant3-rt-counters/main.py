@@ -15,28 +15,28 @@ def get_live_counters(conn):
     cursor = conn.cursor()
     placeholders = ",".join("?" * len(MACHINES))
     cursor.execute(f"""
-        SELECT Machine, Counter_infeed, Counter_Outfeed, Counter_infeed_DE
+        SELECT Machine, Counter_infeed, Counter_Outfeed
         FROM T_M_Filler_Process
         WHERE Machine IN ({placeholders})
     """, *MACHINES)
-    return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+    return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
 
 def update_counters(conn, live):
     cursor = conn.cursor()
-    for machine, (infeed, outfeed, infeed_de) in live.items():
+    for machine, (infeed, outfeed) in live.items():
         cursor.execute("""
             UPDATE [Change paper brik]
-            SET In_Feed_MC = ?, Out_Feed_MC = ?, In_Feed_DE_MC = ?
+            SET In_Feed_MC = ?, Out_Feed_MC = ?
             WHERE ID = (
                 SELECT MAX(ID)
                 FROM [Change paper brik]
                 WHERE Machine = ? AND [end time] IS NULL
             )
-        """, infeed, outfeed, infeed_de, machine)
+        """, infeed, outfeed, machine)
 
         if cursor.rowcount:
-            log.debug("[%s] counters updated — infeed=%s outfeed=%s infeed_de=%s", machine, infeed, outfeed, infeed_de)
+            log.debug("[%s] counters updated — infeed=%s outfeed=%s", machine, infeed, outfeed)
 
     conn.commit()
 
