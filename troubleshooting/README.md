@@ -8,8 +8,11 @@ Canonical production SQL stays in `pipeline/sql/`.
 
 ## Case 2026-07: Step-13 counters going NULL
 
-**Status:** OPEN — comms and V5.8 cleared; second-writer trap deployed, awaiting
-next incident.
+**Status:** CLOSED (2026-07-04) — second writer captured by the
+`CPB_Write_Audit` trap the same day it was deployed: a Budibase operator-app
+full-row save (`APP_NAME() = 'node-mssql'`, `HOST_NAME() = '8e96675d4482'`,
+the Budibase Docker container). App fixed; trap kept live as a tripwire;
+permanent guard trigger added. See **Verdict** below.
 
 ### Symptom
 
@@ -58,7 +61,42 @@ incidents starting ~06-30. Operators already write `[Change paper brik]`
 post-production (brik scans → `total_Var_Brik`; that's why
 `TRI_UPDATE_SCANNED_BRIKS` exists).
 
-### Active trap — `CPB_WRITE_AUDIT.sql`
+### Verdict — CASE CLOSED (2026-07-03/04)
+
+The trap sprang on its first day. `CPB_Write_Audit` captured the overwriter:
+
+- **`APP_NAME() = 'node-mssql'`** — the Node.js `mssql` driver → Budibase's
+  SQL Server datasource.
+- **`HOST_NAME() = '8e96675d4482'`** — Docker container short ID as hostname
+  → the Budibase server container.
+
+Confirmed mechanism (matches the prime-suspect hypothesis above): an
+operator-facing Budibase app screen saved the **full bound row** back around
+batch close — columns not on the form (the PLC-owned counters) went back as
+NULL. A row-match/WHERE gap in the app query explains the F4→G3 cross-stamp.
+
+**Fix (2026-07-03/04):** the operator app was corrected so its save is
+column-scoped and can no longer null the PLC-owned counter columns.
+
+**Hardening:**
+
+- `TRI_CPB_WRITE_AUDIT` + `dbo.CPB_Write_Audit` **kept live** as a tripwire;
+  the verdict query below stays re-runnable any time.
+- **`pipeline/sql/TRI_CPB_FEED_GUARD.sql` (2026-07-11):** permanent companion
+  trigger on `[Change paper brik]` — once `In_Feed_MC` / `Out_Feed_MC` /
+  `In_Feed_DE_MC` / `Sampling_Waste` hold data, no direct writer can regress
+  them to 0/NULL. Regressed columns are restored from `deleted.*` (the rest of
+  the save goes through), and each restore is fingerprinted to `t_log` as
+  `_FEEDGUARD` with app/host/login. Trigger-originated writes (the V5.8
+  Step-13 stamp, incl. legitimate A/B/D/M re-logs to lower values) are exempt
+  via `TRIGGER_NESTLEVEL()`. This turns "fixed this one app" into "class of
+  bug eliminated".
+
+**Attribution limit (post-mortem):** Budibase connects as one shared SQL
+login, so DB-side audit attributes to the system, not the person —
+human-level attribution needs Budibase's own audit log.
+
+### Tripwire (kept live) — `CPB_WRITE_AUDIT.sql`
 
 Deployed 2026-07-03. `TRI_CPB_WRITE_AUDIT` on `[Change paper brik]` logs every
 change to the five step-13 columns (old → new) plus the caller's identity —
@@ -66,7 +104,8 @@ change to the five step-13 columns (old → new) plus the caller's identity —
 trigger runs in the writer's own session, so these report *who wrote*, not the
 trigger. Own TRY/CATCH, logs only on change, safe long-term.
 
-**Verdict query (run after the next incident):**
+**Verdict query (this is what closed the case; re-run any time as a tripwire
+check):**
 
 ```sql
 SELECT * FROM dbo.CPB_Write_Audit
@@ -75,10 +114,10 @@ ORDER BY Log_Time DESC;
 ```
 
 A row showing `Old_InFeed = <value> → New_InFeed = NULL` with an `App_Name` /
-`Login_Name` / `Host_Name` that isn't the OPMS writer closes the case.
-**Attribution limit:** identifies the application / login / host, not the human
-— Budibase uses one shared DB login, so a Budibase hit is resolved to app/user
-by matching the timestamp against Budibase's own audit log.
+`Login_Name` / `Host_Name` that isn't the OPMS writer is exactly what closed
+this case (2026-07-03: `node-mssql` / `8e96675d4482`). Any **new** hit after
+the app fix + feed guard means either a second unfixed app screen or a guard
+gap — investigate immediately.
 
 ### Comms audit — archived, kept as evidence
 
@@ -125,10 +164,9 @@ optionally gate the `[end time]` stamp on `i.counter_infeed IS NOT NULL`
 
 ### Hand-off targets
 
-- **Budibase / app owner (prime):** once `CPB_Write_Audit` names the app,
-  review the form/automation bound to `[Change paper brik]` that saves whole
-  rows, and stop it writing the counter columns (or refresh its schema so it
-  round-trips all five columns).
+- **Budibase / app owner (prime):** ✅ DONE — `CPB_Write_Audit` named the app
+  (node-mssql / Budibase container); the operator app's save was corrected
+  2026-07-03/04 so it no longer writes the PLC-owned counter columns.
 - **IT / network & OPMS owner:** comms is cleared for this case, but the
   `Comms_Audit` archive (Q1/Q2 timestamps) is retained if the symptom ever
   proves to have a comms component.
