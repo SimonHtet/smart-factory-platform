@@ -1,8 +1,30 @@
 # Smart Factory Platform
 
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![SQL Server](https://img.shields.io/badge/SQL%20Server-triggers%20%2B%20analytics-CC2927)
+![dbt](https://img.shields.io/badge/dbt-sqlserver-FF694B?logo=dbt&logoColor=white)
+![Power BI](https://img.shields.io/badge/Power%20BI-DirectQuery-F2C811)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-predictive%20maintenance-F7931E?logo=scikitlearn&logoColor=white)
+![Status](https://img.shields.io/badge/status-live%20in%20production-brightgreen)
+![Plants](https://img.shields.io/badge/plants-3-blue)
+![Machines](https://img.shields.io/badge/filler%20machines-23-blue)
+
 End-to-end manufacturing data platform built for DairyPlus Co., Ltd. (Bangkok) — covering 23 Tetra Pak filler machines across 3 dairy production plants.
 
 Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was never needed. The production-operations core went live across all 3 plants within 6 months of an 18-month internal plan and runs daily in production; SAP raw-material integration is in progress (~50% of full scope delivered).
+
+---
+
+## 🏆 Achievements
+
+- **฿3M+ vendor purchase averted** — the quoted MES was never bought; this platform replaced it
+- **6 months to live** across all 3 plants, against an 18-month internal plan
+- **23 machines, 1-second polling** — sub-second SQL trigger event capture alongside a Python pipeline, running daily in production
+- **16+ Budibase low-code apps, 100+ daily active users** on the production floor, fed by this platform
+- **Director-level KPIs** — Power BI efficiency/waste/yield dashboard reviewed weekly by management
+- **Recall-grade traceability** — reel → pallet genealogy that reverse-maps any finished pallet to its supplier reels
+- **Root-caused a silent data-corruption incident** — a write-audit trap caught a second writer overwriting PLC counters; hardened with a guard trigger (`TRI_CPB_FEED_GUARD`) that makes the regression impossible
+- **Formalized into company SOP** — the platform's change management and architecture are codified in the official Digital Transformation SOP (DTO-SOP-001, ISO/IEC 27001 aligned), approved at management level
 
 ---
 
@@ -160,6 +182,32 @@ tba_actual_downtime = total_downtime − de_downtime     (floored at 0)
 so efficiency KPIs reflect the filler's *true* performance. Pure binary edge — no step machine, no segments — and strictly additive over V5.7. `DE_DOWNTIME_SETUP.sql` creates the log table and supporting columns; `temp_production_run` and `v_group_production_run` surface both the raw DE downtime and the corrected actual-downtime figures, kept separate from mini- and big-downtime so each loss category stays auditable.
 
 **Motor-start gate (rev 2026-06-24):** a DE episode only opens once the filler has actually reached **Step 10 (motor start)** for the batch — detected via `[Splicing time 1] IS NOT NULL`, the same marker the Step 13 guard uses. A DE-not-ready signal raised during startup, before the production loop begins, isn't lost output and is ignored. The `1→0` close is a no-op when no episode was opened, so the guard sits entirely on the open side.
+
+---
+
+## 🤖 Machine Learning
+
+### Predictive Maintenance — Breakdown Risk Scoring
+
+[`notebooks/predictive_maintenance_prototype.ipynb`](notebooks/predictive_maintenance_prototype.ipynb)
+
+Random Forest classifier (scikit-learn) that scores each filler machine's **breakdown risk as a continuous 0–100% probability** — shifting maintenance from reactive to proactive. Features are the same signals the live pipeline already collects:
+
+| Feature | Source | Why it matters |
+|---|---|---|
+| `Running_Hour` | PLC odometer counter | Wear accumulates with runtime |
+| `Heat_C` | Temperature sensor | Abnormal heat = friction or lubrication failure |
+| `Vibration` | Vibration sensor | Imbalance or bearing wear shows up here first |
+
+`predict_proba` risk scores feed a threshold-based maintenance alert (≥70% ⇒ flag for inspection), and `feature_importances_` shows which sensor signals matter most — useful for prioritising sensor calibration. Currently a prototype on simulated data; the production path (live `pyodbc` telemetry → retrain on historical breakdown labels → SQL Server Agent inference per shift → risk scores back to Power BI alert tiles) rides entirely on infrastructure that already exists in `pipeline/`.
+
+### Jarvis for the Factory Floor — GenAI over Production Data
+
+Databricks hackathon project: a GenAI assistant that answers natural-language questions over this platform's production data — "which machine had the most downtime last week?", "show me waste% by product" — without the asker needing SQL. Built on the same layered data model (raw signals → event processing → marts) that powers the Power BI reporting.
+
+### Next: MLOps
+
+Airflow and MLflow are approved under the company Digital Transformation SOP (DTO-SOP-001) — the orchestration and experiment-tracking layer for moving the predictive maintenance model from notebook prototype to scheduled, versioned production inference.
 
 ---
 
