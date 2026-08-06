@@ -41,7 +41,8 @@ Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was neve
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V5.8.sql` | Main event trigger on `T_M_Filler_Process` — V5.7 + **DE-line downtime isolation**: edge-detects the upstream feed's not-ready signal so the filler's *actual* downtime can be separated from idle time it didn't cause. *(latest)* |
+| `TRI_UPDATE_FILLER_V6.sql` | Main event trigger on `T_M_Filler_Process` — V5.8 + **DE downtime subordinated to the filling state machine**: inside a filling-downtime window the whole stop is credited to DE as a single episode (edge spikes swallowed) instead of a noisy 0-1-0-1 stream; Step 13 closes any still-open DE episode at batch end (truncated at end time); plus a step-filter hardening patch. Changes KPI *semantics*, hence V6 not V5.9. *(latest — live in production 2026-08-06)* |
+| `TRI_UPDATE_FILLER_V5.8.sql` | V5.7 + **DE-line downtime isolation**: edge-detects the upstream feed's not-ready signal so the filler's *actual* downtime can be separated from idle time it didn't cause. Superseded by V6. |
 | `TRI_UPDATE_FILLER_V5.7.sql` | V5.6 + **reel→pallet traceability capture**: logs the outfeed counter at each real reel splice to `Reel_Splice_log` for recall genealogy. Superseded by V5.8. |
 | `TRI_UPDATE_FILLER_V5.6.sql` | V5.5 + big-downtime *duration* tracking (`Big_Downtime_log`): a breakdown goes `11→8→7→12→13→14` (no CIP) and aborts out of the mini-stoppage logic, so its time loss is captured separately. |
 | `TRI_UPDATE_FILLER_V5.5.sql` | V5.4 + big-downtime *throughput* correction (`Feed_Segment_log`): the feed counter resets to 0 mid-batch without a CIP (`130000→0→150000`); pre-reset values are logged and re-summed so totals are correct. |
@@ -124,9 +125,9 @@ PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V5.8 *(latest)*
+## SQL Trigger — TRI_UPDATE_FILLER_V6 *(latest — live in production 2026-08-06)*
 
-Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version is strictly additive — V5.8 carries forward everything below and adds reel-splice capture (V5.7) and DE-line downtime isolation (V5.8).
+Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version carries the ones below forward — V6 keeps everything through V5.8 (reel-splice capture V5.7, DE-line downtime isolation V5.8) and refines the DE accounting: inside a filling-downtime window the whole stop is credited to DE as one episode rather than a noisy edge stream, and Step 13 closes any still-open DE episode at batch end.
 
 **Events handled:**
 
