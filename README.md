@@ -84,7 +84,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
   Read-only access.  [INGEST PAUSED — IT security review]
     │
-    │  SQL Trigger V5.3               Python ingest_wms.py
+    │  SQL Trigger V6                 Python ingest_wms.py
     │  fires on T_M_Filler_Process    every 5 min via Task Scheduler
     │  (event-driven, sub-second)     [PAUSED]
     ▼                                      ▼
@@ -95,9 +95,13 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
 │  ──────────────────            ─────────────────────────────    │
 │  T_M_Filler_Process            temp_production_run  ◄── live    │
 │  [Change paper brik]           v_group_production_run           │
-│  Down_log                      raw_wms_*  (ingest landing)      │
-│  t_log                         stg_*  (dbt views)               │
-│                                mart_production_runs  (paused)   │
+│  [Change strip]                raw_wms_*  (ingest landing)      │
+│  Down_log          (mini)      stg_*  (dbt views)               │
+│  Big_Downtime_log  (big)       mart_production_runs  (paused)   │
+│  DE_Downtime_log   (DE)                                         │
+│  Feed_Segment_log  (resets)                                     │
+│  Reel_Splice_log   (recall)                                     │
+│  t_log                                                          │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
             ┌──────────┴──────────┐
@@ -123,6 +127,21 @@ WMS → raw_wms_*                                   ├─► mart_production_ru
 PLC → T_M_Filler_Process ──► temp_production_run ──► Power BI
          (TRI_TEMP_PRODUCTION_RUN, event-driven)
 ```
+
+**Downtime + counter capture (trigger-side):**
+```
+                      ┌──► Down_log          mini stops      11→8→9→10→11
+T_M_Filler_Process ───┼──► Big_Downtime_log  breakdowns      11→8→7→12  /  11→7→0  (V6.1)
+  (TRI_UPDATE_        ├──► DE_Downtime_log   DE-line stalls  signal_DE_NotReady
+   FILLER_V6.1)       └──► Feed_Segment_log  counter resets  counter_infeed → 0
+                                                    │
+                                                    ▼  folded in at Step 13 (V6.1)
+                                    [Change paper brik].In_Feed_MC / Out_Feed_MC
+```
+Each log is a separate episode stream so the analytics layer can attribute loss
+independently: mini stoppages, breakdowns, and DE-line stalls never double-count
+each other. `Feed_Segment_log` is the only one that feeds *back* into the batch
+row — V6.1 folds its pre-reset segments into the Step-13 counter snapshot.
 
 ---
 
