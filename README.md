@@ -41,8 +41,9 @@ Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was neve
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V6.3.sql` | V6.2 + **path guard on the feed stash**. V6.2 stashed on *any* exit from step 11 and committed on *any* arrival at step 0, with nothing clearing the stash in between — so a machine parked at rest committed a segment from a counter hours out of date. V6.3 narrows the stash to `11→8` / `11→7` and discards it the moment the machine moves to a step outside `(0, 7, 8)`. *(latest — written 2026-08-27, **NOT deployed**; branch `feat/v6.3-stash-path-guard`)* |
-| `V6.3_CLEANUP_BAD_SEG0.sql` | One-off — finds and removes the bogus `Ended_By='POWERCUT'` segments V6.2 wrote, and repairs the `[Change paper brik]` rows Step 13 folded them into. Read-only until you uncomment the delete. |
+| `TRI_UPDATE_FILLER_V6.4.sql` | V6.3 + **the actual root cause**: `MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test, so a loop-boundary counter reset was logged against the *next* loop's batch. Batch selection for the feed paths now requires a **running** batch (`[Splicing time 1] IS NOT NULL AND [end time] IS NULL`). *(latest — written 2026-08-27, **NOT deployed**; branch `feat/v6.4-running-batch-selection`)* |
+| `V6.4_FIX_WRONG_BATCH_SEGMENTS.sql` | One-off — finds segments whose `Reset_Time` falls outside the batch they are attached to, sizes the inflation against `temp_production_run`, removes them, and repairs `[Change paper brik]`. Read-only until you uncomment the delete. |
+| `TRI_UPDATE_FILLER_V6.3.sql` | V6.2 + **path guard on the feed stash**. V6.2 stashed on *any* exit from step 11 and committed on *any* arrival at step 0, with nothing clearing the stash in between — so a machine parked at rest committed a segment from a counter hours out of date. V6.3 narrows the stash to `11→8` / `11→7` and discards it the moment the machine moves to a step outside `(0, 7, 8)`. *(never deployed — superseded by V6.4)* |
 | `TRI_UPDATE_FILLER_V6.2.sql` | V6.1 + **feed-counter stash on step-11 exit**: `_BD:RESET` only preserves the pre-reset counter if it catches the edge `counter_infeed > 0 → 0`, which never happens when the PLC dies outright and the counter climbs off zero before the next write. Stashes the counter and commits it to `Feed_Segment_log` at `→0`, with a two-way duplicate guard against `_BD:RESET`. *(deployed 2026-08-26; **superseded by V6.3** — see the bug note below)* |
 | `V6.2_ALTER_COLUMNS.sql` | V6.2/V6.3 prerequisite — adds `BigDT_Pending_Infeed` / `BigDT_Pending_Outfeed` to `[Change paper brik]`. Additive and idempotent; safe to run during a production week. |
 | `TRI_UPDATE_FILLER_V6.1.sql` | V6 + **power-cut downtime capture**: a power cut drops a machine to step 0 and needs the full restart ramp, but only the `11→8→0` path was counted, and only by accident. Adds an `11→7` stash and a `→0` big-downtime OPEN, folds `Feed_Segment_log` into the Step-13 counter snapshot, and logs every non-`11→8` exit from step 11 as `_DT:EDGE`. *(live in production 2026-08-24)* |
@@ -152,7 +153,7 @@ edge that V5.5 watches for can happen.
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V6.2 *(live in production 2026-08-26; V6.3 written, not deployed)*
+## SQL Trigger — TRI_UPDATE_FILLER_V6.2 *(live in production 2026-08-26; V6.4 written, not deployed)*
 
 Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version carries the ones below forward — V6 keeps everything through V5.8 (reel-splice capture V5.7, DE-line downtime isolation V5.8) and refines the DE accounting: inside a filling-downtime window the whole stop is credited to DE as one episode rather than a noisy edge stream, and Step 13 closes any still-open DE episode at batch end.
 
@@ -259,7 +260,31 @@ Expect far more `_BD:STASHCLR` than `_BD:SEG0` — most stops recover. Bad segme
 
 **Deploy:** `DROP TRIGGER TRI_UPDATE_FILLER_V6_2` → run `TRI_UPDATE_FILLER_V6.3.sql`. The columns already exist from V6.2.
 
-> ⚠ **Separate root cause, still open.** `_BD:RESET` (V5.5) attaches its segment to `MAX(ID) WHERE End_time_CIP IS NULL`, guarded only by the assumption that *"clean finishes stamp `End_time_CIP` hours before the counter zeros."* When CIP is late or missed, a normal end-of-loop counter reset is logged as a `BREAKDOWN` segment against the **next** loop's batch — producing the same "previous loop's feed appears in this batch" symptom by a different mechanism. Not fixed in V6.3. Diagnose with: segments whose `Reset_Time` predates their batch's `[Splicing time 1]`.
+### V6.4 — Running-Batch Selection *(written 2026-08-27, not deployed)*
+
+**The actual root cause**, proven from `t_log` on M1, 26 Aug (local times; times embedded in the messages are UTC):
+
+```
+20:02:49  _BD:STASHCNT   ...ID=6526  infeed=458457   stash on 6526
+20:56:47  _FLAVORBACKFILL pid=260827-…-M1           batch 6539 CREATED (27 Aug run)
+20:58:42  _BDL:OPEN step=1->0 ID=6539               downtime on the WRONG batch
+22:48:29  _BD:RESET      ...ID=6539  infeed=458457   SEGMENT on the WRONG batch
+23:07:15  _S14:CIP=1     ...ID=6526                  CIP stamped 19 minutes LATER
+```
+
+**`MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test.** The next loop's row is created before this loop's CIP is stamped, so `MAX(ID)` resolves to a *future* batch. The 26 Aug counter was written as a segment onto the 27 Aug batch, and Step 13 folded it in.
+
+V5.5's guard rested on the assumption stated in its own comment — *"clean finishes stamp `End_time_CIP` hours before the counter zeros."* Here it was the other way round, by 19 minutes.
+
+**Fix:** the batch that owns the counter must be **running** — `[Splicing time 1] IS NOT NULL AND [end time] IS NULL`. If no batch is running, the reset is a loop boundary and nothing is logged, which is the correct answer for 22:48 above. Applied at three points: `_BD:RESET`, `_BD:STASHCNT`, and the `_BD:SEG0` commit (which now resolves its own `@GID_SEG_Z0` independently of `@GID_Z0`).
+
+That last one also fixes a claim V6.2 made and got wrong: that the stash and the commit *"can never land on different rows."* They can, and did — which is why no `_BD:SEG0` appears in the M1 log at all. The stash sat on 6526, the commit looked on 6539, found NULL, and wrote nothing.
+
+`@GID_Z0` itself is unchanged; it drives `Big_Downtime_log` and carries V5.6's ICIP semantics.
+
+> ⚠ **Same wrong batch on the downtime side — deliberately NOT fixed.** `_BDL:OPEN` went to 6539 and closed at `dur=18062s`: a **five-hour fake breakdown** on the 27 Aug batch that was really idle time between loops. Correcting it means changing V5.6's `End_time_CIP IS NULL` discriminator, which is the core of the big-downtime design — a decision, not a patch. `V6.4_FIX_WRONG_BATCH_SEGMENTS.sql` step 6 sizes it.
+
+**Deploy:** `DROP TRIGGER TRI_UPDATE_FILLER_V6_2` → run `TRI_UPDATE_FILLER_V6.4.sql`. Columns already exist. Then run the repair script.
 
 ---
 
