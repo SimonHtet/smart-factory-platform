@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-syntax:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile pipeline + ingestion scripts
+        run: |
+          python -m py_compile pipeline/*.py
+          python -m py_compile pipeline/dbt/ingestion/*.py
+          python -m py_compile plant3-rt-counters/*.py
+
+  dbt-parse:
+    name: dbt parse (structural check, no warehouse connection)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipeline/dbt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install unixODBC headers (required to build pyodbc)
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+
+      - name: Install dbt-sqlserver
+        run: pip install dbt-sqlserver
+
+      - name: Write CI profile
+        # dbt parse validates project/model SQL and Jinja without opening a
+        # warehouse connection, but still needs a syntactically valid profile
+        # to resolve `profile: 'dairyplus'` in dbt_project.yml.
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << 'EOF'
+          dairyplus:
+            target: ci
+            outputs:
+              ci:
+                type: sqlserver
+                driver: "ODBC Driver 17 for SQL Server"
+                server: localhost
+                port: 1433
+                database: ci_placeholder
+                schema: analytics
+                authentication: sql
+                user: ci_placeholder
+                password: ci_placeholder
+          EOF
+
+      - name: dbt parse
+        run: dbt parse --no-partial-parse

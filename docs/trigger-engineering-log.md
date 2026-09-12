@@ -1,0 +1,212 @@
+# Trigger Engineering Log
+
+Full version history and root-cause narrative for the SQL trigger that captures sub-second PLC events (`TRI_UPDATE_FILLER_*`) — splice signals, mini/big downtime, DE-line stalls, and the power-cut/feed-counter bug chain from V6.1 through V6.4.
+
+This is the detailed changelog referenced from the [top-level README](../README.md#current-state). Read it if you want the debugging trail; the README covers the shape of the system.
+
+---
+
+## SQL Files
+
+| File | Purpose |
+|------|---------|
+| `TRI_UPDATE_FILLER_V6.4.sql` | V6.3 + **the actual root cause**: `MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test, so a loop-boundary counter reset was logged against the *next* loop's batch. Batch selection for the feed paths now requires a **running** batch (`[Splicing time 1] IS NOT NULL AND [end time] IS NULL`). *(latest — written 2026-08-27, **NOT deployed**; branch `feat/v6.4-running-batch-selection`)* |
+| `V6.4_FIX_WRONG_BATCH_SEGMENTS.sql` | One-off — finds segments whose `Reset_Time` falls outside the batch they are attached to, sizes the inflation against `temp_production_run`, removes them, and repairs `[Change paper brik]`. Read-only until you uncomment the delete. |
+| `TRI_UPDATE_FILLER_V6.3.sql` | V6.2 + **path guard on the feed stash**. V6.2 stashed on *any* exit from step 11 and committed on *any* arrival at step 0, with nothing clearing the stash in between — so a machine parked at rest committed a segment from a counter hours out of date. V6.3 narrows the stash to `11→8` / `11→7` and discards it the moment the machine moves to a step outside `(0, 7, 8)`. *(never deployed — superseded by V6.4)* |
+| `TRI_UPDATE_FILLER_V6.2.sql` | V6.1 + **feed-counter stash on step-11 exit**: `_BD:RESET` only preserves the pre-reset counter if it catches the edge `counter_infeed > 0 → 0`, which never happens when the PLC dies outright and the counter climbs off zero before the next write. Stashes the counter and commits it to `Feed_Segment_log` at `→0`, with a two-way duplicate guard against `_BD:RESET`. *(deployed 2026-08-26; **superseded by V6.3** — see the bug note below)* |
+| `V6.2_ALTER_COLUMNS.sql` | V6.2/V6.3 prerequisite — adds `BigDT_Pending_Infeed` / `BigDT_Pending_Outfeed` to `[Change paper brik]`. Additive and idempotent; safe to run during a production week. |
+| `TRI_UPDATE_FILLER_V6.1.sql` | V6 + **power-cut downtime capture**: a power cut drops a machine to step 0 and needs the full restart ramp, but only the `11→8→0` path was counted, and only by accident. Adds an `11→7` stash and a `→0` big-downtime OPEN, folds `Feed_Segment_log` into the Step-13 counter snapshot, and logs every non-`11→8` exit from step 11 as `_DT:EDGE`. *(live in production 2026-08-24)* |
+| `TRI_UPDATE_FILLER_V6.sql` | Main event trigger on `T_M_Filler_Process` — V5.8 + **DE downtime subordinated to the filling state machine**: inside a filling-downtime window the whole stop is credited to DE as a single episode (edge spikes swallowed) instead of a noisy 0-1-0-1 stream; Step 13 closes any still-open DE episode at batch end (truncated at end time); plus a step-filter hardening patch. Changes KPI *semantics*, hence V6 not V5.9. *(live in production 2026-08-06)* |
+| `TRI_UPDATE_FILLER_V5.8.sql` | V5.7 + **DE-line downtime isolation**: edge-detects the upstream feed's not-ready signal so the filler's *actual* downtime can be separated from idle time it didn't cause. Superseded by V6. |
+| `TRI_UPDATE_FILLER_V5.7.sql` | V5.6 + **reel→pallet traceability capture**: logs the outfeed counter at each real reel splice to `Reel_Splice_log` for recall genealogy. Superseded by V5.8. |
+| `TRI_UPDATE_FILLER_V5.6.sql` | V5.5 + big-downtime *duration* tracking (`Big_Downtime_log`): a breakdown goes `11→8→7→12→13→14` (no CIP) and aborts out of the mini-stoppage logic, so its time loss is captured separately. |
+| `TRI_UPDATE_FILLER_V5.5.sql` | V5.4 + big-downtime *throughput* correction (`Feed_Segment_log`): the feed counter resets to 0 mid-batch without a CIP (`130000→0→150000`); pre-reset values are logged and re-summed so totals are correct. |
+| `TRI_UPDATE_FILLER_V5.4.sql` | Splice tracking, mini-downtime segments, CIP end time — superseded |
+| `DE_DOWNTIME_SETUP.sql` | One-time setup for V5.8 — creates `DE_Downtime_log` and the supporting columns. |
+| `V_REEL_PALLET.sql` | Reel→pallet recall views (`v_reel_pallet_estimate`, `v_reel_pallet_map`) — see Traceability section below. |
+| `TRI_TEMP_PRODUCTION_RUN.sql` | Temporary WMS-free production run tracker — Step 13 guard patched 2026-06-08; surfaces DE-downtime + actual-downtime columns (V5.8); includes `TRI_UPDATE_SCANNED_BRIKS` (Step 4) for late scan support *(live)* |
+| `V_GROUP_PRODUCTION_RUN.sql` | Group summary view over `temp_production_run` — A/D/M grouped, B1/B2 individual; adds back big-downtime feed loss (V5.5), exposes big-downtime time loss (V5.6) and DE-line downtime (V5.8), each separate from mini-stoppage downtime |
+
+**Big-downtime model (A/B/D/M, the CIP groups):** a real breakdown resets the OPMS feed counter to 0 and does an intermediate CIP (ICIP) with **no `Signal_Final_CIP`**, vs a normal finish which raises it (FCIP). `End_time_CIP IS NULL` is the single discriminator throughout — no CIP ⇒ same batch continuing (accumulate throughput + count the time loss); CIP ⇒ legitimate run end (ignore).
+
+---
+
+## Downtime + Counter Capture (trigger-side)
+
+```
+                      ┌──► Down_log          mini stops      11→8→9→10→11
+T_M_Filler_Process ───┼──► Big_Downtime_log  breakdowns      11→8→7→12  /  11→7→0  (V6.1)
+  (TRI_UPDATE_        ├──► DE_Downtime_log   DE-line stalls  signal_DE_NotReady
+   FILLER_V6.2)       └──► Feed_Segment_log  counter resets  counter_infeed → 0  (V5.5)
+                                              PLC death      stash @ 11→x, commit @ →0  (V6.2)
+                                                    │
+                                                    ▼  folded in at Step 13 (V6.1)
+                                    [Change paper brik].In_Feed_MC / Out_Feed_MC
+```
+Each log is a separate episode stream so the analytics layer can attribute loss
+independently: mini stoppages, breakdowns, and DE-line stalls never double-count
+each other. `Feed_Segment_log` is the only one that feeds *back* into the batch
+row — V6.1 folds its pre-reset segments into the Step-13 counter snapshot, and
+V6.2 makes sure a segment is written even when the PLC dies before the counter
+edge that V5.5 watches for can happen.
+
+---
+
+## SQL Trigger — TRI_UPDATE_FILLER_V6.2 *(live in production 2026-08-26; V6.4 written, not deployed)*
+
+Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version carries the ones below forward — V6 keeps everything through V5.8 (reel-splice capture V5.7, DE-line downtime isolation V5.8) and refines the DE accounting: inside a filling-downtime window the whole stop is credited to DE as one episode rather than a noisy edge stream, and Step 13 closes any still-open DE episode at batch end.
+
+**Events handled:**
+
+| Transition | Event | Action |
+|---|---|---|
+| Step 10 | splice signal 0→1 | Write `Splicing time 1` |
+| Step 13 | — | Write `end time`, `In_Feed_MC`, `Out_Feed_MC` (V6.1: folds `Feed_Segment_log` in — true batch total) |
+| Step 14 + CIP=1 | A/B/D/M | Write `End_time_CIP` (1-hour cooldown) |
+| Step 11 → 8 | `START` | Increment `Downtime_Count`, stamp timer |
+| Step 8 → 9 | `SEGMENT` | Log step-8 duration, reset timer |
+| Step 9 → 10 | `SEGMENT` | Log step-9 duration, reset timer |
+| Step 10 → 11 | `END` | Log step-10 warmup, close event |
+| Step 8/9/10 → 7 | `ABORT` | Roll back mini-stoppage; stash stop time for big-downtime |
+| counter → 0 | `_BD:RESET` (V5.5) | Log pre-reset feed to `Feed_Segment_log` (big-downtime throughput) |
+| Step 7 → 12 | `_BDL:OPEN` (V5.6) | Open `Big_Downtime_log` row (big-downtime time loss starts) |
+| Step 14 + CIP=1 | `_BDL:VOID` (V5.6) | FCIP ⇒ intentional end ⇒ void the open big-downtime row |
+| → Step 11 | `_BDL:CLOSE` (V5.6) | Resume with no CIP ⇒ close row, stamp duration (the loss) |
+| real reel splice | `_RS` (V5.7) | Log outfeed counter to `Reel_Splice_log` (`Splice_No` = kth end-roll) for recall genealogy |
+| `signal_DE_NotReady` 0→1 | `_DE:START` (V5.8) | Open `DE_Downtime_log` row — upstream feed not ready, stamp start (only once past Step 10 / motor start) |
+| `signal_DE_NotReady` 1→0 | `_DE:END` (V5.8) | Close row, stamp `Duration_Seconds`, add to the batch's `Total_DE_Downtime_Seconds` |
+| Step 11 → 7 | `_BDL:STASH` (V6.1) | Hardware-fault drop straight to 7 — stash the stop time, open no mini event |
+| → Step 0 | `_BDL:OPEN` (V6.1) | Powered down — open `Big_Downtime_log`, absorbing an open mini event if there is one |
+| Step 11 → *(not 8)* | `_DT:EDGE` (V6.1) | Observability only, **all** machines — which machines bypass step 8 on a stop |
+| Step 11 → 7 or 8 | `_BD:STASHCNT` (V6.3) | Stash `counter_infeed`/`outfeed` while still good — no event, no state change. Frequent and boring by design |
+| → step outside (0,7,8) | `_BD:STASHCLR` (V6.3) | Machine recovered or was never down — discard the stash so no segment is written |
+| → Step 0 | `_BD:SEG0` (V6.2) | Commit the stashed counters to `Feed_Segment_log` as `Ended_By='POWERCUT'`, then clear the stash |
+| counter → 0 | `_BD:RESET…-DUPSKIPPED` (V6.2) | The `→0` commit already logged this exact counter — skip rather than log a second segment |
+
+**Open batch detection (Step 13 guard — V5.4):**
+
+| Machine group | Open batch condition |
+|---|---|
+| A / D / M | `End_time_CIP IS NULL` — batch stays open until CIP completes; Step 13 re-stamps `end time` + counters on every fire |
+| F / G / H / K | `[end time] IS NULL` — write once |
+
+> "Breakdown" in company terms means >30 min — that classification is applied at the reporting layer, not in the trigger.
+
+### V6.1 — Power-Cut Downtime *(live in production 2026-08-24)*
+
+A power cut drops a machine to **step 0** and recovery needs the full restart ramp `0→14→1→3→4→5→6→7→8→9→10→11`. Only one of the two entry paths was ever counted, and only by accident:
+
+| Path | V6 behaviour |
+|---|---|
+| `11→8→0→…→11` (most machines) | **Counted, accidentally.** `START` stamps the timer at `11→8`; nothing in the ramp matches an `ABORT` (`6→7` is not `8/9/10→7`) or a second `START` (`7→8` is not `11→8`), so the ramp's `8→9` `SEGMENT` logs the whole outage as "step 8 dwell". |
+| `11→7→0→…→11` (older hardware, seen on M1) | **Lost.** Nothing opens at `11→7`, so the ramp's `8→9` is correctly swallowed by the `Current_Downtime_Start IS NOT NULL` guard and the outage leaves no trace. |
+
+V6.1 routes both to `Big_Downtime_log`, since either way the machine needed a full restart:
+
+- **`11→7`** stashes `BigDT_Pending_Start` and opens no mini event, mirroring the stash the `8/9/10→7` `ABORT` already does.
+- **`→0`** opens the big-downtime row. The existing `7→12` OPEN cannot fire on a power cut — there is no step 12 anywhere in the restart ramp. Start time is taken, in order, from: an open mini event (absorbed — its seconds rolled back and its count decremented, so `11→8→0` moves MINI→BIG and one physical event lands in one bucket), else `BigDT_Pending_Start`, else now.
+- Closes at `→ step 11` via the existing V5.6 `_BDL:CLOSE`, unchanged.
+
+**Step-13 counter fold.** `In_Feed_MC` / `Out_Feed_MC` now carry the *true* batch total: the pre-reset segments in `Feed_Segment_log` are folded into the Step-13 snapshot. The base stays `i.counter_*` (live PLC) rather than `cpb.In_Feed_MC`, so the A/B/D/M Step-13 re-fire recomputes instead of accumulating onto its own previous write. `Sampling_Waste` is deliberately left on the raw counters — `Feed_Segment_log` has no DE column, so folding outfeed but not `counter_infeed_DE` would make the subtraction meaningless.
+
+> ⚠ **Correction (2026-08-24): the `V_GROUP_PRODUCTION_RUN` change once listed here was based on a false premise — do NOT apply it.** The claim was that `temp_production_run` reads `cpb.[In_Feed_MC]`, so the view would fold the segments a second time. It does not. `TRI_TEMP_PRODUCTION_RUN` takes `i.counter_infeed`/`i.counter_outfeed` **straight from the PLC** on the splice path, and freezes them once `end_time` is set; the code that reads `cpb.[In_Feed_MC]` sits inside a commented-out "manual refresh" block. So V6.1's fold lands in `[Change paper brik]` and stops there — it never reaches `temp_production_run`, and `in_feed_mc + seg_in_feed` in the view stays correct. Gating the `seg` CTE would strip the prior segments while `temp_production_run` still holds only the final one, i.e. **under-count**.
+>
+> Two independent lineages both reach Power BI and should agree: `cpb.In_Feed_MC` (raw from `plant3-rt-counters`, folded at Step 13) → dbt → `mart_production_runs`; and `temp_production_run.in_feed_mc` (PLC, frozen at close) → `v_group_production_run` as `+ seg_in_feed`. Reconciling the two is the post-deploy check.
+
+**Scope:** `A%/B%/D%/M%`, matching every other `Big_Downtime_log` branch — M1 is covered. The `_DT:EDGE` tag fires on **all** machines with no state change, so if F/G/H/K also bypass step 8 it will show up in `t_log` without a behaviour change first.
+
+**Known gap:** a *hard* power cut writes nothing, so there is no `→0` edge to fire on and the outage stays invisible. This handles the soft descent only, where the PLC survives long enough to write step 0.
+
+### V6.2 — Feed-Counter Stash on Step-11 Exit *(written 2026-08-24, not deployed)*
+
+V6.1 counts the power-cut *downtime*. The *feed* was still being lost on the same event.
+
+Since V5.5, the pre-reset counter is preserved by `_BD:RESET` watching a **counter edge** — `d.counter_infeed > 0 → i.counter_infeed = 0` — and saving `deleted.counter_infeed` to `Feed_Segment_log`. That edge only exists if the PLC is alive to write the zero. When it dies outright it stops writing entirely, and by the time it writes again the counter has already climbed off zero (`359250 → 1500` in a single update). No edge, no segment, feed gone — and no CIP on that path either, so nothing else closes the batch.
+
+**Stop watching the counter. Watch the steps.**
+
+- **Stash on leaving step 11** (A/B/D/M). Any `11 → anything` transition saves `counter_infeed`/`counter_outfeed` into `BigDT_Pending_Infeed`/`_Outfeed`. *All* exits, not just `→8` and `→7`, so a straight `11→0` is covered. It **overwrites** every time — deliberately unlike `BigDT_Pending_Start`'s `IS NULL` guard, because a mini downtime early in the batch must not pin the stash to a stale low value that a real outage hours later would commit. Mini downtimes never reach step 0, so an uncommitted stash is simply replaced by the next exit. Opens no event and changes no downtime state.
+- **Commit at `→0`**, inside the same `NOT EXISTS … Status='OPEN'` guard as the `Big_Downtime_log` insert, so a `0→x→0` bounce cannot log twice. Writes the segment as `Ended_By='POWERCUT'` and clears the stash.
+- **Duplicate guard, both ways.** An outage that *both* passes step 0 and zeroes the counter would otherwise log two segments and Step 13 would fold both. Both paths capture the same pre-reset value by construction, so each skips when `Feed_Segment_log` already holds that `In_Feed_Seg` for the batch. `_BD:RESET` also clears the stash.
+
+**Nothing downstream changes.** V6.1's Step-13 fold already computes `In_Feed_MC = i.counter_infeed + SUM(Feed_Segment_log)`, and for A/B/D/M it *re-fires* while `End_time_CIP IS NULL` — exactly the no-CIP case — so the next re-fire self-heals the total the moment a segment exists. No CIP-side work, no view change.
+
+**Trade-off:** the dedupe collapses two genuine breakdowns that reset at an *identical* counter value within one batch into a single segment. Vanishingly unlikely with six-digit counters, and chosen over letting duplicates through.
+
+**Known gap:** unchanged from V6.1 — a hard cut where the PLC never writes step 0 leaves no edge to stash against. That needs a heartbeat/staleness detector on resume, not an edge trigger.
+
+**Deploy:** run `V6.2_ALTER_COLUMNS.sql` → `DROP TRIGGER TRI_UPDATE_FILLER_V6_1` → run `TRI_UPDATE_FILLER_V6.2.sql`. No other object changes. *(Deployed 2026-08-26 — superseded by V6.3 the next day, see below.)*
+
+### V6.3 — Path Guard on the Feed Stash *(written 2026-08-27, not deployed)*
+
+**A bug V6.2 caused in production, found the day after it went in.** V6.2 stashed the counter on *any* exit from step 11 and committed it on *any* arrival at step 0, with nothing clearing the stash in between. A machine that stopped briefly in the morning and was later parked at rest — passing through step 0 — committed a segment built from a counter value hours out of date. Step 13 folded it in, and `[Change paper brik]` came out carrying feed that belonged to an earlier part of the day.
+
+The signature was distinctive: **`[Change paper brik]` wrong, `temp_production_run` right.** `temp_production_run` reads `counter_infeed` straight from the PLC and never sees the fold, so only the folded side was affected. A/B/D/M only, because that is the scope of the stash.
+
+V6.3 makes the segment conditional on the real breakdown **path** rather than on the endpoints:
+
+- **Stash narrowed** to `11→8` and `11→7` only, instead of any exit from step 11.
+- **New stash clear** — any move to a step outside `(0, 7, 8)` discards the stash. The machine recovered, or was never down.
+- The `→0` commit is unchanged; it already required a stash to exist.
+
+| Path | Result |
+|---|---|
+| `11→8→0` or `11→7→0` | segment written — real breakdown |
+| `11→8→9→10→11` | cleared at step 9, no segment — recovery |
+| idle / rest `→0`, no preceding stop | no stash exists, no segment |
+
+Expect far more `_BD:STASHCLR` than `_BD:SEG0` — most stops recover. Bad segments already written by V6.2 are cleaned up with `V6.3_CLEANUP_BAD_SEG0.sql`.
+
+**Deploy:** `DROP TRIGGER TRI_UPDATE_FILLER_V6_2` → run `TRI_UPDATE_FILLER_V6.3.sql`. The columns already exist from V6.2.
+
+### V6.4 — Running-Batch Selection *(written 2026-08-27, not deployed)*
+
+**The actual root cause**, proven from `t_log` on M1, 26 Aug (local times; times embedded in the messages are UTC):
+
+```
+20:02:49  _BD:STASHCNT   ...ID=6526  infeed=458457   stash on 6526
+20:56:47  _FLAVORBACKFILL pid=260827-…-M1           batch 6539 CREATED (27 Aug run)
+20:58:42  _BDL:OPEN step=1->0 ID=6539               downtime on the WRONG batch
+22:48:29  _BD:RESET      ...ID=6539  infeed=458457   SEGMENT on the WRONG batch
+23:07:15  _S14:CIP=1     ...ID=6526                  CIP stamped 19 minutes LATER
+```
+
+**`MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test.** The next loop's row is created before this loop's CIP is stamped, so `MAX(ID)` resolves to a *future* batch. The 26 Aug counter was written as a segment onto the 27 Aug batch, and Step 13 folded it in.
+
+V5.5's guard rested on the assumption stated in its own comment — *"clean finishes stamp `End_time_CIP` hours before the counter zeros."* Here it was the other way round, by 19 minutes.
+
+**Fix:** the batch that owns the counter must be **running** — `[Splicing time 1] IS NOT NULL AND [end time] IS NULL`. If no batch is running, the reset is a loop boundary and nothing is logged, which is the correct answer for 22:48 above. Applied at three points: `_BD:RESET`, `_BD:STASHCNT`, and the `_BD:SEG0` commit (which now resolves its own `@GID_SEG_Z0` independently of `@GID_Z0`).
+
+That last one also fixes a claim V6.2 made and got wrong: that the stash and the commit *"can never land on different rows."* They can, and did — which is why no `_BD:SEG0` appears in the M1 log at all. The stash sat on 6526, the commit looked on 6539, found NULL, and wrote nothing.
+
+`@GID_Z0` itself is unchanged; it drives `Big_Downtime_log` and carries V5.6's ICIP semantics.
+
+> ⚠ **Same wrong batch on the downtime side — deliberately NOT fixed.** `_BDL:OPEN` went to 6539 and closed at `dur=18062s`: a **five-hour fake breakdown** on the 27 Aug batch that was really idle time between loops. Correcting it means changing V5.6's `End_time_CIP IS NULL` discriminator, which is the core of the big-downtime design — a decision, not a patch. `V6.4_FIX_WRONG_BATCH_SEGMENTS.sql` step 6 sizes it.
+
+**Deploy:** `DROP TRIGGER TRI_UPDATE_FILLER_V6_2` → run `TRI_UPDATE_FILLER_V6.4.sql`. Columns already exist. Then run the repair script.
+
+---
+
+## Reel → Pallet Traceability (Recall Genealogy)
+
+Reverse traceability for product recall: a bad finished pallet → the supplier reel(s) that fed it → every other pallet those reels touched. Views: `v_reel_pallet_estimate` (reel-level), `v_reel_pallet_map` (the many-to-many recall surface). Files: `V_REEL_PALLET.sql`, `TRI_UPDATE_FILLER_V5.7.sql`.
+
+**Method — supplier-declared counts, cumulative-summed (exact, retroactive):** each reel slot on `[Change paper brik]` carries the briks the supplier declares for that reel. Cumulatively summing them gives each reel a `start_count … end_count` span; dividing by the pallet size maps it to a pallet range, using `FLOOR`/`CEILING` so a reel straddling a boundary is flagged for **both** pallets (recall-safe over-inclusion).
+
+**Why not the live outfeed counter:** capturing the counter at each splice is more precise on waste, but the raw counter *resets* mid-run (`1 → 130k → repeat`) and depends on catching every reset — one missed reset silently points a recall at the wrong product. The supplier-count method is **monotonic by construction**: its error is small, bounded, and washes out once the warehouse real-number reconciliation takes over. **Design rule: for recall, a bounded predictable error beats a silent catastrophic one.** (The counter-at-splice variant is kept in `Reel_Splice_log` for a future counter-accurate version on a clean full batch.)
+
+Two raw-data quirks handled in the views: the PLC repeats the same `(Order, Reel)` across consecutive columns while one reel runs (deduped via `LAG` + `ROW_NUMBER`), and pallet numbering resets per **supplier run** — a reel change within one supplier keeps counting, a supplier change restarts at 1 — so `pallet_no` is not unique per batch and recall-by-pallet filters `supplier_no` + `pallet_no` (`order_no` kept for reference).
+
+---
+
+## DE-Line Downtime Isolation (V5.8)
+
+The TBA filler sits idle whenever the upstream DE line isn't ready — time that was previously buried inside total downtime and unfairly charged to the filler. V5.8 edge-detects `signal_DE_NotReady` (0=OK, 1=down) on every machine: `0→1` opens a `DE_Downtime_log` row, `1→0` closes it and accumulates the duration onto the batch. The analytics layer then computes:
+
+```
+tba_actual_downtime = total_downtime − de_downtime     (floored at 0)
+```
+
+so efficiency KPIs reflect the filler's *true* performance. Pure binary edge — no step machine, no segments — and strictly additive over V5.7. `DE_DOWNTIME_SETUP.sql` creates the log table and supporting columns; `temp_production_run` and `v_group_production_run` surface both the raw DE downtime and the corrected actual-downtime figures, kept separate from mini- and big-downtime so each loss category stays auditable.
+
+**Motor-start gate (rev 2026-06-24):** a DE episode only opens once the filler has actually reached **Step 10 (motor start)** for the batch — detected via `[Splicing time 1] IS NOT NULL`, the same marker the Step 13 guard uses. A DE-not-ready signal raised during startup, before the production loop begins, isn't lost output and is ignored. The `1→0` close is a no-op when no episode was opened, so the guard sits entirely on the open side.
