@@ -10,10 +10,10 @@ This is the detailed changelog referenced from the [top-level README](../README.
 
 | File | Purpose |
 |------|---------|
-| `TRI_UPDATE_FILLER_V6.4.sql` | V6.3 + **the actual root cause**: `MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test, so a loop-boundary counter reset was logged against the *next* loop's batch. Batch selection for the feed paths now requires a **running** batch (`[Splicing time 1] IS NOT NULL AND [end time] IS NULL`). *(latest — written 2026-08-27, **NOT deployed**; branch `feat/v6.4-running-batch-selection`)* |
+| `TRI_UPDATE_FILLER_V6.4.sql` | V6.3 + **the actual root cause**: `MAX(ID) WHERE End_time_CIP IS NULL` is not a current-batch test, so a loop-boundary counter reset was logged against the *next* loop's batch. Batch selection for the feed paths now requires a **running** batch (`[Splicing time 1] IS NOT NULL AND [end time] IS NULL`). *(written 2026-08-27 — **live in production**, current version)* |
 | `V6.4_FIX_WRONG_BATCH_SEGMENTS.sql` | One-off — finds segments whose `Reset_Time` falls outside the batch they are attached to, sizes the inflation against `temp_production_run`, removes them, and repairs `[Change paper brik]`. Read-only until you uncomment the delete. |
-| `TRI_UPDATE_FILLER_V6.3.sql` | V6.2 + **path guard on the feed stash**. V6.2 stashed on *any* exit from step 11 and committed on *any* arrival at step 0, with nothing clearing the stash in between — so a machine parked at rest committed a segment from a counter hours out of date. V6.3 narrows the stash to `11→8` / `11→7` and discards it the moment the machine moves to a step outside `(0, 7, 8)`. *(never deployed — superseded by V6.4)* |
-| `TRI_UPDATE_FILLER_V6.2.sql` | V6.1 + **feed-counter stash on step-11 exit**: `_BD:RESET` only preserves the pre-reset counter if it catches the edge `counter_infeed > 0 → 0`, which never happens when the PLC dies outright and the counter climbs off zero before the next write. Stashes the counter and commits it to `Feed_Segment_log` at `→0`, with a two-way duplicate guard against `_BD:RESET`. *(deployed 2026-08-26; **superseded by V6.3** — see the bug note below)* |
+| `TRI_UPDATE_FILLER_V6.3.sql` | V6.2 + **path guard on the feed stash**. V6.2 stashed on *any* exit from step 11 and committed on *any* arrival at step 0, with nothing clearing the stash in between — so a machine parked at rest committed a segment from a counter hours out of date. V6.3 narrows the stash to `11→8` / `11→7` and discards it the moment the machine moves to a step outside `(0, 7, 8)`. *(never deployed — superseded by V6.4 before it shipped)* |
+| `TRI_UPDATE_FILLER_V6.2.sql` | V6.1 + **feed-counter stash on step-11 exit**: `_BD:RESET` only preserves the pre-reset counter if it catches the edge `counter_infeed > 0 → 0`, which never happens when the PLC dies outright and the counter climbs off zero before the next write. Stashes the counter and commits it to `Feed_Segment_log` at `→0`, with a two-way duplicate guard against `_BD:RESET`. *(deployed 2026-08-26; **superseded by V6.4** — see the bug note below)* |
 | `V6.2_ALTER_COLUMNS.sql` | V6.2/V6.3 prerequisite — adds `BigDT_Pending_Infeed` / `BigDT_Pending_Outfeed` to `[Change paper brik]`. Additive and idempotent; safe to run during a production week. |
 | `TRI_UPDATE_FILLER_V6.1.sql` | V6 + **power-cut downtime capture**: a power cut drops a machine to step 0 and needs the full restart ramp, but only the `11→8→0` path was counted, and only by accident. Adds an `11→7` stash and a `→0` big-downtime OPEN, folds `Feed_Segment_log` into the Step-13 counter snapshot, and logs every non-`11→8` exit from step 11 as `_DT:EDGE`. *(live in production 2026-08-24)* |
 | `TRI_UPDATE_FILLER_V6.sql` | Main event trigger on `T_M_Filler_Process` — V5.8 + **DE downtime subordinated to the filling state machine**: inside a filling-downtime window the whole stop is credited to DE as a single episode (edge spikes swallowed) instead of a noisy 0-1-0-1 stream; Step 13 closes any still-open DE episode at batch end (truncated at end time); plus a step-filter hardening patch. Changes KPI *semantics*, hence V6 not V5.9. *(live in production 2026-08-06)* |
@@ -52,7 +52,7 @@ edge that V5.5 watches for can happen.
 
 ---
 
-## SQL Trigger — TRI_UPDATE_FILLER_V6.2 *(live in production 2026-08-26; V6.4 written, not deployed)*
+## SQL Trigger — TRI_UPDATE_FILLER_V6.4 *(live in production, current version)*
 
 Sub-second event capture for splice signals (~10ms pulse — too fast for Python polling). Runs alongside the Python pipeline on the same `T_M_Filler_Process` table. Each version carries the ones below forward — V6 keeps everything through V5.8 (reel-splice capture V5.7, DE-line downtime isolation V5.8) and refines the DE accounting: inside a filling-downtime window the whole stop is credited to DE as one episode rather than a noisy edge stream, and Step 13 closes any still-open DE episode at batch end.
 
@@ -135,9 +135,9 @@ Since V5.5, the pre-reset counter is preserved by `_BD:RESET` watching a **count
 
 **Known gap:** unchanged from V6.1 — a hard cut where the PLC never writes step 0 leaves no edge to stash against. That needs a heartbeat/staleness detector on resume, not an edge trigger.
 
-**Deploy:** run `V6.2_ALTER_COLUMNS.sql` → `DROP TRIGGER TRI_UPDATE_FILLER_V6_1` → run `TRI_UPDATE_FILLER_V6.2.sql`. No other object changes. *(Deployed 2026-08-26 — superseded by V6.3 the next day, see below.)*
+**Deploy:** run `V6.2_ALTER_COLUMNS.sql` → `DROP TRIGGER TRI_UPDATE_FILLER_V6_1` → run `TRI_UPDATE_FILLER_V6.2.sql`. No other object changes. *(Deployed 2026-08-26 — superseded by V6.4, see below.)*
 
-### V6.3 — Path Guard on the Feed Stash *(written 2026-08-27, not deployed)*
+### V6.3 — Path Guard on the Feed Stash *(written 2026-08-27, never deployed — superseded by V6.4 before it shipped)*
 
 **A bug V6.2 caused in production, found the day after it went in.** V6.2 stashed the counter on *any* exit from step 11 and committed it on *any* arrival at step 0, with nothing clearing the stash in between. A machine that stopped briefly in the morning and was later parked at rest — passing through step 0 — committed a segment built from a counter value hours out of date. Step 13 folded it in, and `[Change paper brik]` came out carrying feed that belonged to an earlier part of the day.
 
@@ -159,7 +159,7 @@ Expect far more `_BD:STASHCLR` than `_BD:SEG0` — most stops recover. Bad segme
 
 **Deploy:** `DROP TRIGGER TRI_UPDATE_FILLER_V6_2` → run `TRI_UPDATE_FILLER_V6.3.sql`. The columns already exist from V6.2.
 
-### V6.4 — Running-Batch Selection *(written 2026-08-27, not deployed)*
+### V6.4 — Running-Batch Selection *(written 2026-08-27 — live in production, current version)*
 
 **The actual root cause**, proven from `t_log` on M1, 26 Aug (local times; times embedded in the messages are UTC):
 

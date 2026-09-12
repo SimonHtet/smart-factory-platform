@@ -49,10 +49,9 @@ More pages (hourly trends, per-product breakdown) and the DAX behind them → [`
 
 ## Current State
 
-**Deployed to production:** `TRI_UPDATE_FILLER_V6.2` (2026-08-26) — has a known feed-attribution bug on machine-park edge cases, described below.
-**Written and ready to deploy:** `V6.4`, which fixes the actual root cause (a stale-batch-selection bug that predates V6.2). Not yet run against production as of this writing.
+**Deployed to production:** `TRI_UPDATE_FILLER_V6.4` — fixes the root cause behind V6.2's feed-attribution bug: batch selection for the feed paths now requires an actually **running** batch (`[Splicing time 1] IS NOT NULL AND [end time] IS NULL`), not just "no CIP yet."
 
-The short version: V6.1 added power-cut downtime capture and went live cleanly. The very next fix on top of it (V6.2, a feed-counter stash) shipped with its own bug, found a day later. Chasing that bug down (V6.3) surfaced a *deeper*, pre-existing bug one layer down (V6.4) — a batch-selection query that looks like a "current batch" filter but isn't. Full trail, with the actual `t_log` evidence that cracked it, is in [`docs/trigger-engineering-log.md`](docs/trigger-engineering-log.md).
+The short version: V6.1 added power-cut downtime capture and went live cleanly. The very next fix on top of it (V6.2, a feed-counter stash) shipped with its own bug, found a day later. Chasing that bug down (V6.3) surfaced a *deeper*, pre-existing bug one layer down — a batch-selection query that looked like a "current batch" filter but wasn't, fixed in V6.4. Full trail, with the actual `t_log` evidence that cracked it, is in [`docs/trigger-engineering-log.md`](docs/trigger-engineering-log.md).
 
 **WMS ingest is also paused** pending an internal IT security review and Change Request (`ingest_wms.py`, under `pipeline/dbt/ingestion/`). Power BI is temporarily pointed at `analytics.temp_production_run` (a WMS-free fallback table) instead of the dbt `mart_production_runs_view`, and reverts once ingest is reinstated.
 
@@ -73,7 +72,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
   Finished goods tracking — carton scanning, product resends.
   Read-only access.  [INGEST PAUSED — IT security review]
     │
-    │  SQL Trigger V6.2                Python ingest_wms.py
+    │  SQL Trigger V6.4                Python ingest_wms.py
     │  fires on T_M_Filler_Process    every 5 min via Task Scheduler
     │  (event-driven, sub-second)     [PAUSED]
     ▼                                      ▼
