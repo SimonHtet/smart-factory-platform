@@ -77,7 +77,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
     │  (event-driven, sub-second)     [PAUSED]
     ▼                                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                 DB_BUDIBASE  172.22.x.x  (db_owner)            │
+│                 DB_BUDIBASE  172.22.x.x  (db_owner)             │
 │                                                                 │
 │  dbo.*                         analytics.*                      │
 │  ──────────────────            ─────────────────────────────    │
