@@ -8,9 +8,9 @@
 ![Status](https://img.shields.io/badge/status-live%20in%20production-brightgreen)
 ![CI](https://github.com/SimonHtet/smart-factory-platform/actions/workflows/ci.yml/badge.svg)
 ![Plants](https://img.shields.io/badge/plants-3-blue)
-![Machines](https://img.shields.io/badge/filler%20machines-23-blue)
+![Machines](https://img.shields.io/badge/filling%20machines-28%20(23%20Tetra%20Pak%20%C2%B7%204%20SIG%20%C2%B7%201%20Sidel)-blue)
 
-End-to-end manufacturing data platform built for DairyPlus Co., Ltd. (Bangkok) — covering 23 Tetra Pak filler machines across 3 dairy production plants.
+End-to-end manufacturing data platform built for DairyPlus Co., Ltd. (Bangkok) — covering a 28-machine filling fleet across 3 dairy production plants: 23 Tetra Pak, 4 SIG, and 1 new Sidel PET-bottle line (group L, on trial).
 
 Built in-house after a vendor MES was quoted at ฿3M+ — the purchase was never needed. The production-operations core went live across all 3 plants within 6 months of an 18-month internal plan and runs daily in production; SAP raw-material integration is in progress (~50% of full scope delivered).
 
@@ -90,6 +90,7 @@ WMS Server (172.22.x.x) — WMSDairyPlus2015
 │  Feed_Segment_log  (resets)                                     │
 │  Reel_Splice_log   (recall)                                     │
 │  t_log                                                          │
+│  tbl_sidel         (Sidel PET baskets, group L — trial)         │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
             ┌──────────┴──────────┐
@@ -109,6 +110,18 @@ Trigger-side downtime/counter capture (four independent episode logs, how they f
 ## Reel → Pallet Traceability & DE-Line Downtime Isolation
 
 Two of the platform's more involved pieces of domain logic — reverse-traceability for product recall (reel → pallet genealogy) and isolating upstream DE-line stalls from the filler's own downtime — are documented in full in [`docs/trigger-engineering-log.md`](docs/trigger-engineering-log.md).
+
+---
+
+## Sidel PET Line (Group L)
+
+The Sidel filler (machine group **L**) is the newest machine in the fleet and the only one that fills **PET bottles** (the other 27 fill cartons), so the brik-based model above (paper reels, `[Change paper brik]`, splice logs) doesn't fit it. It runs on its own small system. The line is still **on trial**.
+
+**Baskets instead of reels.** Filled bottles are tracked by basket. `dbo.tbl_sidel` holds one row per basket. The trigger `trg_tbl_sidel_renumber` ([`TRI_SIDEL_BASKET_RENUMBER.sql`](pipeline/sql/TRI_SIDEL_BASKET_RENUMBER.sql)) keeps `Baskets` as a running 1..N count per **Product_id + Type**. Rows with the same product and type keep counting up, and a different type starts again at 1. The count is renumbered on insert, delete, and on any edit to Product_id or Type.
+
+**Store the barcode, parse at report time.** Earlier apps split each scanned barcode into its fields with JavaScript in the app and stored them across 10–20 columns. The Sidel table stores **only the raw barcode, in one column**. The JavaScript that splits it runs only in the **printed report** that is submitted to QA / QSM. The report looks the same as before, but the table stays narrow: there's no per-field column drift, and the barcode stays the single source of truth.
+
+**Planned: material-code guard.** Once the trial ends, rows whose material code doesn't match the expected product will be **blocked at the table**. For now the trial only uses a handful of material codes, so mismatches are allowed through.
 
 ---
 
